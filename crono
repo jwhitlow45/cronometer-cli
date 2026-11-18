@@ -921,8 +921,8 @@ def cmd_unlog(args) -> None:
 def saved_names_by_food(foods: dict) -> dict[str, list[str]]:
     by_food: dict[str, list[str]] = {}
     for name, food in sorted(foods.items()):
-        strings, tokens = parse_rpc(food["request"])
-        by_food.setdefault(tokens[locate_add_fields(strings, tokens)["food_id"]], []).append(name)
+        food_id, _, _ = saved_parts(name, food)
+        by_food.setdefault(food_id, []).append(name)
     return by_food
 
 
