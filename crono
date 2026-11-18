@@ -252,11 +252,11 @@ def food_from(response: str, food_id: str) -> dict:
                 name_at = position + 7 if volume == "0" or volume.startswith("-") else position + 8
                 grams = next(float(value) for value in tokens[name_at + 1 :] if "." in value)
                 # Names typed in by users can carry stray spaces, such as "  bar".
-                amount, name = float(tokens[position + 1]), " ".join(table[int(tokens[name_at]) - 1].split())
-                label = name if amount == 1 else f"{amount:g} {name}".strip()
+                amount, unit = float(tokens[position + 1]), " ".join(table[int(tokens[name_at]) - 1].split()) or "serving"
+                label = unit if amount == 1 else f"{amount:g} {unit}"
                 # A serving size with no weight cannot be logged or shown as an amount.
                 if grams > 0:
-                    measures.append({"id": tokens[position + 5], "name": label or "serving", "grams": grams})
+                    measures.append({"id": tokens[position + 5], "name": label, "amount": amount, "unit": unit, "grams": grams})
         nutrients = {
             int(tokens[position + 2]): float(tokens[position + 1])
             for position, token in enumerate(tokens)
@@ -289,11 +289,15 @@ def nutrition_summary(amount: dict[int, float]) -> str:
 
 
 def serving_text(food: dict | None, measure_id: str | None, grams: float) -> str:
-    """An amount in its serving size, as the website shows it: '2 small or tall - each 12 fl oz'."""
+    """An amount in its serving size, as the website shows it: '2 small or tall - each 12 fl oz'.
+
+    A serving size can hold more than one unit, such as 2 tbsp, so one of
+    those reads as 2 tbsp rather than 1 2 tbsp.
+    """
     measure = next((measure for measure in food["measures"] if measure["id"] == measure_id), None) if food else None
     if not measure:
         return f"{round(grams, 1):g} g"
-    return f"{round(grams / measure['grams'], 2):g} {measure['name']}"
+    return f"{round(grams / measure['grams'] * measure['amount'], 2):g} {measure['unit']}"
 
 
 def servings_from(response: str) -> list[dict]:
