@@ -52,6 +52,8 @@ DIARY_GROUPS = {0: "Uncategorized", 1: "Breakfast", 2: "Lunch", 3: "Dinner", 4: 
 # Nutrient ids in Cronometer's food data, which follow USDA numbering.
 CALORIES, CARBS, PROTEIN, FAT, CAFFEINE = 208, 205, 203, 204, 262
 SEARCH_RESULTS = 15
+# A single letter is easy to type by mistake, and would log whichever food starts with it.
+SHORTEST_NAME_START = 2
 USER_AGENT = "crono-cli"
 TIMEOUT_SECONDS = 30
 
@@ -686,13 +688,15 @@ def unknown_food(foods: dict, name: str) -> CronoError:
 
 
 def resolve_saved(foods: dict, name: str) -> str:
-    """A saved food by its name, or by the start of its name when only one saved food starts that way."""
+    """A saved food by its name, or by the start of its name (2 letters or more) when only one saved food starts that way."""
     if not name:
         # An empty name starts every saved name, so it would match the only saved food.
         raise CronoError(f"A food name is empty. Saved: {', '.join(sorted(foods)) or 'none'}.")
     if name in foods:
         return name
     starting = sorted(saved for saved in foods if saved.startswith(name))
+    if starting and len(name) < SHORTEST_NAME_START:
+        raise CronoError(f"Type at least {SHORTEST_NAME_START} letters of a saved food's name. {name} could be {' or '.join(starting)}.")
     if len(starting) == 1:
         return starting[0]
     if starting:
