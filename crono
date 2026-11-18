@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Log saved Cronometer foods from the terminal.
+"""Log foods to Cronometer from the terminal.
 
 Cronometer has no public API for personal accounts. Its web app talks to the
-server over GWT-RPC, so this tool logs in the way the website does and replays
-the "add food" request the web app sent when the food was first added by hand.
-Replaying the browser's own request keeps the serving size, unit, and diary
-group exactly as the website records them, without decoding every field.
+server over GWT-RPC, so this tool logs in the way the website does and sends
+the same "add food" request the website sends. A saved food is that request,
+built when the food was found with crono search and filled in with the date,
+meal, and session each time it is logged.
 
 The login flow, build hash lookup, and the authenticate and removeServing
 payloads follow github.com/cphoskins/cronometer-mcp (MIT license).
@@ -14,8 +14,7 @@ payloads follow github.com/cphoskins/cronometer-mcp (MIT license).
 from __future__ import annotations
 
 import argparse
-import csv
-import io
+import difflib
 import json
 import os
 import re
@@ -37,8 +36,6 @@ STATE_DIR = Path.home() / ".local" / "state" / "crono"
 COOKIES_PATH = STATE_DIR / "cookies.txt"
 SESSION_PATH = STATE_DIR / "session.json"
 LAST_LOG_PATH = STATE_DIR / "last-log.json"
-# Food names by Cronometer food id. Looking one up costs an export, which Cronometer throttles.
-FOOD_NAMES_PATH = STATE_DIR / "food-names.json"
 
 SITE = "https://cronometer.com"
 MODULE_BASE = f"{SITE}/cronometer/"
@@ -48,7 +45,6 @@ STRING_TYPE = "java.lang.String/2004016611"
 DAY_TYPE = "com.cronometer.shared.entries.models.Day/782579793"
 TIME_TYPE = "com.cronometer.shared.entries.models.Time/1552252503"
 DAY_TYPE_PREFIX = "com.cronometer.shared.entries.models.Day/"
-TIME_TYPE_PREFIX = "com.cronometer.shared.entries.models.Time/"
 # Cronometer's default meal (diary group) names by number. An account can rename
 # them in its settings, and crono does not read those names.
 DIARY_GROUPS = {0: "Uncategorized", 1: "Breakfast", 2: "Lunch", 3: "Dinner", 4: "Snacks"}
@@ -61,9 +57,6 @@ TIMEOUT_SECONDS = 30
 BOLD, DIM, CYAN = 1, 2, 36
 # Color only for a person at a terminal, and never when NO_COLOR is set (no-color.org).
 USE_COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
-
-# A GWT-RPC request body, on its own or inside "Copy as cURL" output.
-RPC_BODY_PATTERN = re.compile(r"7\|0\|\d+\|https://cronometer\.com/cronometer/\|[^'\"\s]*\|")
 
 
 class CronoError(Exception):
@@ -109,7 +102,8 @@ def locate_add_fields(strings: list[str], tokens: list[str]) -> dict:
     updateDiary takes the session nonce first and the user id second. The
     serving's date is a Day object: its type ref, then day, month, and year.
     Six places after the day is a number that holds the meal in its high 16
-    bits and the food's unit (can, cup, and so on) in its low 16 bits.
+    bits and the food's unit (can, cup, and so on) in its low 16 bits. Then
+    come the weight in grams, the food id, and the serving size id.
     """
     if len(strings) < 4 or strings[3] != "updateDiary":
         raise CronoError("That request is not an updateDiary request.")
@@ -126,17 +120,31 @@ def locate_add_fields(strings: list[str], tokens: list[str]) -> dict:
         if tokens[position] == day_ref and as_date(tokens[position + 1 : position + 4])
     ]
     if len(date_starts) != 1:
-        raise CronoError("Expected exactly one food in the request. Add one food at a time while capturing.")
-    meal_and_unit = date_starts[0] + 6
-    if not tokens[meal_and_unit].isdigit():
-        raise CronoError(f"Unexpected serving in the request: {tokens[date_starts[0] : meal_and_unit + 1]}")
+        raise CronoError("Expected exactly one food in the saved request.")
+    meal_and_unit, grams = date_starts[0] + 6, date_starts[0] + 9
+    try:
+        int(tokens[meal_and_unit]), float(tokens[grams])
+    except (ValueError, IndexError):
+        raise CronoError(f"Unexpected serving in the request: {tokens[date_starts[0] : grams + 1]}") from None
     return {
         "nonce": int(tokens[first_value]) - 1,
         "user_id": first_value + 1,
         "date": date_starts[0],
         "meal_and_unit": meal_and_unit,
+        "grams": grams,
         "food_id": date_starts[0] + 10,
+        "measure_id": date_starts[0] + 12,
     }
+
+
+def scale_request(saved: str, times: float) -> str:
+    """The same saved food with its amount multiplied, as crono log beef-curry:0.5 asks."""
+    if times == 1:
+        return saved
+    strings, tokens = parse_rpc(saved)
+    grams = locate_add_fields(strings, tokens)["grams"]
+    tokens[grams] = str(round(float(tokens[grams]) * times, 3))
+    return join_rpc(strings, tokens)
 
 
 def new_add_request(food_id: str, measure_id: str, grams: float, day: date) -> str:
@@ -188,15 +196,6 @@ def remove_serving_body(policy_hash: str, nonce: str, serving_id: str, user_id: 
     )
 
 
-def export_token_body(policy_hash: str, nonce: str, user_id: str) -> str:
-    # Asks for a token that lasts 3600 seconds. The final 2 picks the token's
-    # scope, and is the value the reference client sends for exports.
-    return (
-        f"7|0|8|{MODULE_BASE}|{policy_hash}|{SERVICE}|generateAuthorizationToken|{STRING_TYPE}|I|"
-        f"com.cronometer.shared.user.AuthScope/2065601159|{nonce}|1|2|3|4|4|5|6|6|7|8|{user_id}|3600|7|2|"
-    )
-
-
 def get_servings_body(policy_hash: str, nonce: str, user_id: str, day: date) -> str:
     # getServings takes a first and last day, then a start and end time. No times means the whole day.
     day_object = f"7|{day.day}|{day.month}|{day.year}"
@@ -229,7 +228,7 @@ def class_ref(table: list[str], class_name: str) -> str | None:
 
 
 def food_from(response: str, food_id: str) -> dict:
-    """Read a food's serving sizes and its nutrients per 100 g from a getFood response.
+    """Read a food's English name, serving sizes, and nutrients per 100 g from a getFood response.
 
     In reading order, a serving size (class Measure, or DerivedMeasure for
     generic sizes like cup and ml) is its class ref, then its amount, a flag,
@@ -237,11 +236,14 @@ def food_from(response: str, food_id: str) -> dict:
     is 0 when the food has none, and otherwise a boxed number: a class ref and
     the value. The weight in grams is the next decimal number after the name. A
     nutrient is its class ref, then its amount per 100 g, then its nutrient id.
+    A translation of the food's name is its class ref, then a Language (class
+    ref, code, English name, icon, native name), then the translated name.
     """
     table = string_table(response)
     tokens = reading_tokens(response)
     measure_refs = {class_ref(table, "Measure"), class_ref(table, "DerivedMeasure")} - {None}
     nutrient_ref = class_ref(table, "Nutrient")
+    translation_ref, language_ref = class_ref(table, "Translation"), class_ref(table, "Language")
     measures = []
     try:
         for position, token in enumerate(tokens):
@@ -249,26 +251,49 @@ def food_from(response: str, food_id: str) -> dict:
                 volume = tokens[position + 6]
                 name_at = position + 7 if volume == "0" or volume.startswith("-") else position + 8
                 grams = next(float(value) for value in tokens[name_at + 1 :] if "." in value)
-                amount, name = float(tokens[position + 1]), table[int(tokens[name_at]) - 1]
+                # Names typed in by users can carry stray spaces, such as "  bar".
+                amount, name = float(tokens[position + 1]), " ".join(table[int(tokens[name_at]) - 1].split())
                 label = name if amount == 1 else f"{amount:g} {name}".strip()
-                measures.append({"id": tokens[position + 5], "name": label or "serving", "grams": grams})
+                # A serving size with no weight cannot be logged or shown as an amount.
+                if grams > 0:
+                    measures.append({"id": tokens[position + 5], "name": label or "serving", "grams": grams})
         nutrients = {
             int(tokens[position + 2]): float(tokens[position + 1])
             for position, token in enumerate(tokens)
             if token == nutrient_ref and "." in tokens[position + 1]
         }
+        english_names = [
+            table[int(tokens[position + 6]) - 1]
+            for position, token in enumerate(tokens)
+            if token == translation_ref and tokens[position + 1] == language_ref and table[int(tokens[position + 2]) - 1] == "en"
+        ]
     except (ValueError, IndexError, StopIteration):
         raise CronoError(f"Could not read food {food_id}: {response[:200]}") from None
-    return {"measures": measures, "nutrients": nutrients}
+    return {"name": english_names[0] if english_names else None, "measures": measures, "nutrients": nutrients}
 
 
-def nutrition_summary(per_100_grams: dict[int, float], grams: float) -> str:
-    amount = {nutrient: value * grams / 100 for nutrient, value in per_100_grams.items()}
+def scaled(per_100_grams: dict[int, float], grams: float) -> dict[int, float]:
+    return {nutrient: value * grams / 100 for nutrient, value in per_100_grams.items()}
+
+
+def macros_summary(amount: dict[int, float]) -> str:
     parts = [f"{amount.get(CALORIES, 0):.0f} kcal"]
     parts += [f"{round(amount.get(nutrient, 0), 1):g} g {name}" for nutrient, name in ((CARBS, "carbs"), (PROTEIN, "protein"), (FAT, "fat"))]
-    if round(amount.get(CAFFEINE, 0)):
-        parts.append(f"{amount[CAFFEINE]:.0f} mg caffeine")
     return " · ".join(parts)
+
+
+def nutrition_summary(amount: dict[int, float]) -> str:
+    """Calories, carbs, protein, and fat, then caffeine when there is any."""
+    caffeine = f" · {amount[CAFFEINE]:.0f} mg caffeine" if round(amount.get(CAFFEINE, 0)) else ""
+    return macros_summary(amount) + caffeine
+
+
+def serving_text(food: dict | None, measure_id: str | None, grams: float) -> str:
+    """An amount in its serving size, as the website shows it: '2 small or tall - each 12 fl oz'."""
+    measure = next((measure for measure in food["measures"] if measure["id"] == measure_id), None) if food else None
+    if not measure:
+        return f"{round(grams, 1):g} g"
+    return f"{round(grams / measure['grams'], 2):g} {measure['name']}"
 
 
 def servings_from(response: str) -> list[dict]:
@@ -277,18 +302,22 @@ def servings_from(response: str) -> list[dict]:
     GWT writes a response backwards, and sends longs as quoted strings. Each
     entry's id is its only long. In reading order, the entry's food id comes just
     before its id, its grams before that, and five places before the id is a
-    number whose high 16 bits are the entry's diary group.
+    number whose high 16 bits are the entry's diary group. The id of its serving
+    size comes just after its id. The serving size only changes how the amount
+    reads, so an entry whose serving size cannot be read still shows, in grams.
     """
     tokens = reading_tokens(response)
     entries = []
     try:
         for position, token in enumerate(tokens):
             if token.startswith('"'):
+                measure_id = tokens[position + 1] if position + 1 < len(tokens) else ""
                 entries.append({
                     "serving_id": token.strip('"'),
                     "food_id": str(int(tokens[position - 1])),
                     "grams": float(tokens[position - 2]),
                     "group": int(tokens[position - 5]) >> 16,
+                    "measure_id": measure_id if measure_id.isdigit() else None,
                 })
         expected = int(tokens[1])
     except (ValueError, IndexError):
@@ -296,6 +325,17 @@ def servings_from(response: str) -> list[dict]:
     if len(entries) != expected:
         raise CronoError(f"Read {len(entries)} of the day's {expected} entries. Cronometer may have changed.")
     return entries
+
+
+GWT_CLASS = re.compile(r"[\w.$]+/\d+")
+
+
+def refusal_reason(response: str) -> str:
+    """A readable reason from a GWT-RPC error, which names the exception's class and usually has a message."""
+    strings = string_table(response)
+    message = next((text for text in strings if text and not GWT_CLASS.fullmatch(text)), None)
+    exception = next((text.rsplit(".", 1)[-1].split("/")[0] for text in strings if GWT_CLASS.fullmatch(text)), None)
+    return (message or exception or response[:200]).rstrip(".")
 
 
 def serving_id_from(response: str) -> str | None:
@@ -382,7 +422,7 @@ class Cronometer:
                 return response.read().decode()
         except urllib.error.HTTPError as error:
             body = error.read().decode(errors="replace")[:300]
-            # The query string can hold a one-time export token.
+            # Leave out the query string, which only repeats the request.
             raise HttpError(f"{url.split('?')[0]} returned HTTP {error.code}: {body}", error.code) from None
         except urllib.error.URLError as error:
             raise CronoError(f"Could not reach Cronometer: {error.reason}") from None
@@ -451,11 +491,11 @@ class Cronometer:
         if response.startswith("//OK") and "ErrorEntryChangeResult" not in response:
             return response
         hint = (
-            " Cronometer changed its web app, so saved foods may need saving again."
+            " Cronometer changed its web app, so saved foods may need saving again with crono search."
             if "IncompatibleRemoteServiceException" in response
             else ""
         )
-        raise CronoError(f"Cronometer rejected the request: {response[:300]}{hint}")
+        raise CronoError(f"Cronometer refused the request: {refusal_reason(response)}.{hint}")
 
     def add_serving(self, saved_request: str, day: date, meal: int) -> str | None:
         response = self.rpc(
@@ -468,30 +508,12 @@ class Cronometer:
     def remove_serving(self, serving_id: str) -> None:
         self.rpc(lambda: remove_serving_body(self.policy_hash, self.nonce, serving_id, self.user_id))
 
-    def export(self, kind: str, day: date, required_column: str) -> list[dict]:
-        """One day of a Cronometer CSV export, such as servings or dailySummary.
-
-        Each export needs a new token: Cronometer refuses a token that was already used.
-        """
-        response = self.rpc(lambda: export_token_body(self.policy_hash, self.nonce, self.user_id))
-        token = re.search(r'"([^"]+)"', response)
-        if not token:
-            raise CronoError(f"Could not read the export token: {response[:200]}")
-        query = urllib.parse.urlencode(
-            {"nonce": token.group(1), "generate": kind, "start": day.isoformat(), "end": day.isoformat()}
-        )
-        exported = self.fetch(f"{SITE}/export?{query}")
-        rows = list(csv.DictReader(io.StringIO(exported)))
-        if rows and required_column not in rows[0]:
-            raise CronoError(f"Unexpected {kind} export from Cronometer: {exported[:200]}")
-        return rows
-
-    def search_foods(self, query: str) -> list[dict]:
+    def search_foods(self, query: str, limit: int) -> list[dict]:
         """The website's food search, best match first."""
         if not (self.user_id and self.nonce):
             self.login()
         params = urllib.parse.urlencode(
-            {"query": query.upper(), "maxResults": SEARCH_RESULTS, "sources": "All", "categoryId": 0, "selectedTab": "ALL", "type": "All"}
+            {"query": query.upper(), "maxResults": limit, "sources": "All", "categoryId": 0, "selectedTab": "ALL", "type": "All"}
         )
         for attempt in range(2):
             try:
@@ -539,24 +561,16 @@ class Cronometer:
         response = self.rpc(lambda: get_servings_body(self.policy_hash, self.nonce, self.user_id, day))
         return servings_from(response)
 
-    def food_names(self, day: date, food_ids: list[str]) -> dict[str, str]:
-        """Names for the foods in the day's diary, looking up the ones crono has not seen before.
-
-        getFood answers with every string about a food (translations, measures,
-        and more) and no fixed place for its name. So the name is the one string
-        it shares with the day's servings export.
-        """
-        names = read_json(FOOD_NAMES_PATH, {})
-        missing = [food_id for food_id in dict.fromkeys(food_ids) if food_id not in names]
-        if missing:
-            diary_names = {row["Food Name"] for row in self.export("servings", day, "Food Name")}
-            for food_id in missing:
-                response = self.rpc(lambda: get_food_body(self.policy_hash, self.nonce, food_id))
-                matches = diary_names.intersection(string_table(response))
-                if len(matches) == 1:
-                    names[food_id] = matches.pop()
-            write_json(FOOD_NAMES_PATH, names)
-        return names
+    def day_entries(self, day: date) -> list[dict]:
+        """The day's diary entries in meal order, each with its food's name, serving, and nutrients."""
+        entries = sorted(self.day_servings(day), key=lambda entry: entry["group"])
+        foods = self.foods(list(dict.fromkeys(entry["food_id"] for entry in entries)))
+        for entry in entries:
+            food = foods.get(entry["food_id"])
+            entry["name"] = (food and food["name"]) or f"Food {entry['food_id']}"
+            entry["serving"] = serving_text(food, entry["measure_id"], entry["grams"])
+            entry["nutrients"] = scaled(food["nutrients"], entry["grams"]) if food else None
+        return entries
 
 
 def open_session(config: dict) -> Cronometer:
@@ -586,57 +600,103 @@ def cmd_login(args) -> None:
     print("Logged in.")
 
 
-def cmd_save(args) -> None:
-    from_stdin = not sys.stdin.isatty()
-    text = sys.stdin.read() if from_stdin else subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
-    requests = [body for body in RPC_BODY_PATTERN.findall(text) if parse_rpc(body)[0][3:4] == ["updateDiary"]]
-    if len(requests) != 1:
-        raise CronoError(
-            "Expected one updateDiary request in the clipboard, found "
-            f"{len(requests)}. In DevTools, copy the 'app' request whose payload contains updateDiary."
-        )
+def cut(text: str, width: int) -> str:
+    return text if len(text) <= width else text[: max(width - 1, 0)] + "…"
 
-    strings, tokens = parse_rpc(requests[0])
+
+def room_after(margin: int) -> int | None:
+    """The columns left on a terminal line after margin, or None when the output is not a terminal."""
+    return shutil.get_terminal_size().columns - 1 - margin if sys.stdout.isatty() else None
+
+
+def table(rows: list[tuple[str, ...]], styles: list[tuple[int, ...]], shrink: int, room: int | None) -> list[str]:
+    """Rows as columns two spaces apart.
+
+    When the rows are wider than room, the shrink column is cut short so lines
+    do not wrap.
+    """
+    widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]))]
+    if room is not None:
+        excess = sum(widths) + 2 * (len(widths) - 1) - room
+        widths[shrink] = max(10, widths[shrink] - max(excess, 0))
+    return [
+        "  ".join(style(cut(cell, width).ljust(width), *codes) for cell, width, codes in zip(row, widths, styles))
+        for row in rows
+    ]
+
+
+def calories_text(nutrients: dict[int, float] | None) -> str:
+    return f"{nutrients.get(CALORIES, 0):5.0f} kcal" if nutrients is not None else "    ? kcal"
+
+
+def saved_parts(food: dict) -> tuple[str, str, float]:
+    """A saved food's food id, serving size id, and weight in grams."""
+    strings, tokens = parse_rpc(food["request"])
     fields = locate_add_fields(strings, tokens)
-    start = fields["date"]
-    captured_on = as_date(tokens[start : start + 3])
-    # The nonce is a live session secret. Every replay fills in the current one.
-    strings[fields["nonce"]] = ""
-
-    config = read_json(CONFIG_PATH, {})
-    config.setdefault("foods", {})[args.name] = {"request": join_rpc(strings, tokens), "captured_on": captured_on.isoformat()}
-    write_json(CONFIG_PATH, config)
-    if not from_stdin:
-        # "Copy as cURL" includes the session cookies.
-        subprocess.run(["pbcopy"], input="", text=True)
-        print("Cleared the clipboard, since it held your session cookies.")
-    print(f"Saved {args.name}.")
-    if any(s.startswith(TIME_TYPE_PREFIX) for s in strings):
-        print("Note: this request includes a time of day. Every log of it will use that same time.")
+    return tokens[fields["food_id"]], tokens[fields["measure_id"]], float(tokens[fields["grams"]])
 
 
 def cmd_list(args) -> None:
-    foods = read_json(CONFIG_PATH, {}).get("foods", {})
+    config = read_json(CONFIG_PATH, {})
+    foods = config.get("foods", {})
     if args.names:
         print("\n".join(sorted(foods)))
         return
     if not foods:
-        print("No saved foods. See: crono save --help")
-    for name, food in sorted(foods.items()):
-        print(f"{name}  (saved {food['captured_on']})")
+        print("No saved foods. Find one with crono search, then press tab to save it.")
+        return
+    parts = {name: saved_parts(food) for name, food in foods.items()}
+    details = open_session(config).foods(list(dict.fromkeys(food_id for food_id, _, _ in parts.values())))
+    rows = []
+    for name in sorted(parts):
+        food_id, measure_id, grams = parts[name]
+        food = details.get(food_id)
+        nutrients = scaled(food["nutrients"], grams) if food else None
+        rows.append((name, (food and food["name"]) or f"Food {food_id}", serving_text(food, measure_id, grams), calories_text(nutrients)))
+    for line in table(rows, [(BOLD,), (), (DIM,), ()], shrink=1, room=room_after(0)):
+        print(line)
 
 
-def require_saved(foods: dict, names: list[str]) -> None:
-    unknown = [name for name in names if name not in foods]
-    if unknown:
-        raise CronoError(f"No saved food named {', '.join(unknown)}. Saved: {', '.join(sorted(foods)) or 'none'}")
+def unknown_food(foods: dict, name: str) -> CronoError:
+    close = difflib.get_close_matches(name, list(foods), n=3)
+    hint = f"Did you mean {' or '.join(close)}?" if close else f"Saved: {', '.join(sorted(foods)) or 'none'}."
+    return CronoError(f"No saved food named {name}. {hint}")
+
+
+def resolve_saved(foods: dict, name: str) -> str:
+    """A saved food by its name, or by the start of its name when only one saved food starts that way."""
+    if name in foods:
+        return name
+    starting = sorted(saved for saved in foods if saved.startswith(name))
+    if len(starting) == 1:
+        return starting[0]
+    if starting:
+        raise CronoError(f"{name} could be {' or '.join(starting)}.")
+    raise unknown_food(foods, name)
+
+
+def parse_food_amount(text: str) -> tuple[str, float]:
+    """Split NAME:AMOUNT, as in beef-curry:0.5. A name alone logs its saved amount."""
+    name, colon, amount = text.rpartition(":")
+    if not colon:
+        return text, 1.0
+    try:
+        times = Fraction(amount)
+    except (ValueError, ZeroDivisionError):
+        times = 0
+    if not name or times <= 0:
+        example = name or "americano"
+        raise CronoError(f"{text}: put a number above 0 after the colon, as in {example}:2 or {example}:1/2.")
+    return name, float(times)
 
 
 def cmd_delete(args) -> None:
     config = read_json(CONFIG_PATH, {})
     foods = config.get("foods", {})
-    require_saved(foods, args.names)
     names = list(dict.fromkeys(args.names))
+    for name in names:
+        if name not in foods:
+            raise unknown_food(foods, name)
     for name in names:
         del foods[name]
     write_json(CONFIG_PATH, config)
@@ -649,12 +709,38 @@ def cmd_log(args) -> None:
         return
     config = read_json(CONFIG_PATH, {})
     foods = config.get("foods", {})
-    require_saved(foods, args.foods)
-    for name in args.foods:
-        locate_add_fields(*parse_rpc(foods[name]["request"]))
+    to_log = []
+    for text in args.foods:
+        name, times = parse_food_amount(text)
+        name = resolve_saved(foods, name)
+        description = name if times == 1 else f"{times:g} × {name}"
+        to_log.append((description, scale_request(foods[name]["request"], times)))
     session = open_session(config)
-    meal = chosen_meal(args, config)
-    log_foods(session, [(name, foods[name]["request"]) for name in args.foods], args.date, meal)
+    log_foods(session, to_log, args.date, chosen_meal(args, config))
+    print_day_total(session, args.date)
+
+
+def day_label(day: date) -> str:
+    return "Today" if day == date.today() else f"{day:%A, %B} {day.day}"
+
+
+def add_up(amounts: list[dict[int, float]]) -> dict[int, float]:
+    total: dict[int, float] = {}
+    for amount in amounts:
+        for nutrient, value in amount.items():
+            total[nutrient] = total.get(nutrient, 0) + value
+    return total
+
+
+def print_day_total(session: Cronometer, day: date) -> None:
+    # The foods are already logged, so failing to read the total is only worth a note.
+    try:
+        entries = session.day_entries(day)
+    except CronoError as error:
+        print(style(f"Could not read the day's total: {error}", DIM))
+        return
+    total = add_up([entry["nutrients"] for entry in entries if entry["nutrients"] is not None])
+    print(style(f"{day_label(day)}: {macros_summary(total)} · {total.get(CAFFEINE, 0):.0f} mg caffeine", DIM))
 
 
 def log_foods(session: Cronometer, foods: list[tuple[str, str]], day: date, meal: int) -> None:
@@ -707,14 +793,16 @@ def fit(line: str, width: int) -> str:
     return "".join(kept)
 
 
-def pick(labels: list[str], hint: str, actions: dict[bytes, str], multiple: bool = False) -> tuple[str, int, list[int]] | None:
+def pick(
+    labels: list[str], hint: str, actions: dict[bytes, str], multiple: bool = False, cursor: int = 0
+) -> tuple[str, int, list[int]] | None:
     """Show labels as a list to move through with the arrow keys (or j and k).
 
     A key in actions ends the choice. It returns that key's action, the
     highlighted index, and, when multiple is set, the indexes toggled with
     space. q or Escape cancels and returns None. Labels may span lines, and the
     list scrolls when it is taller than the terminal. The list is erased once
-    the choice is made.
+    the choice is made. The highlight starts at cursor.
     """
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         raise CronoError("Choosing needs a terminal.")
@@ -727,7 +815,8 @@ def pick(labels: list[str], hint: str, actions: dict[bytes, str], multiple: bool
     visible = max(1, min(len(labels), (terminal.lines - 3) // height))
     frame_lines = visible * height + 2
     indent = " " * (6 if multiple else 2)
-    cursor, top, chosen = 0, 0, set()
+    cursor = min(cursor, len(labels) - 1)
+    top, chosen = max(0, cursor - visible + 1), set()
 
     def draw() -> None:
         sys.stdout.write("\033[2K" + fit(style(hint, DIM), terminal.columns) + "\n")
@@ -770,22 +859,18 @@ def pick(labels: list[str], hint: str, actions: dict[bytes, str], multiple: bool
         termios.tcsetattr(fd, termios.TCSADRAIN, terminal_settings)
 
 
+def group_name(group: int) -> str:
+    return DIARY_GROUPS.get(group, f"Group {group + 1}")
+
+
 def cmd_unlog(args) -> None:
     session = open_session(read_json(CONFIG_PATH, {}))
-    entries = session.day_servings(args.date)
+    entries = session.day_entries(args.date)
     if not entries:
         raise CronoError(f"Nothing logged on {args.date}.")
-    names = session.food_names(args.date, [entry["food_id"] for entry in entries])
-    for entry in entries:
-        entry["name"] = names.get(entry["food_id"], f"Food {entry['food_id']}")
-    entries.sort(key=lambda entry: entry["group"])
-
-    name_width = max(len(entry["name"]) for entry in entries)
-    labels = []
-    for entry in entries:
-        group = DIARY_GROUPS.get(entry["group"], f"Group {entry['group'] + 1}")
-        details = f"{group}, {round(entry['grams'], 1):g} g"
-        labels.append(f"{entry['name']:<{name_width}}  {style(details, DIM)}")
+    rows = [(entry["name"], group_name(entry["group"]), entry["serving"], calories_text(entry["nutrients"])) for entry in entries]
+    # The picker puts a pointer and a check box before each entry.
+    labels = table(rows, [(), (DIM,), (DIM,), (DIM,)], shrink=0, room=room_after(6))
     hint = "↑/↓ move, space selects, enter unlogs, q cancels"
     result = pick(labels, hint, dict.fromkeys(ENTER_KEYS, "unlog"), multiple=True)
     if not result:
@@ -812,13 +897,13 @@ def search_label(hit: dict, food: dict | None, saved_as: list[str]) -> str:
         return f"{name_line}\n{style('nutrition unavailable', DIM)}"
     serving = next((measure for measure in food["measures"] if measure["id"] == str(hit["measureId"])), None)
     if serving:
-        nutrition = f"{hit['measureDisplayName']}: {nutrition_summary(food['nutrients'], serving['grams'])}"
+        nutrition = f"{hit['measureDisplayName']}: {nutrition_summary(scaled(food['nutrients'], serving['grams']))}"
     else:
-        nutrition = f"100 g: {nutrition_summary(food['nutrients'], 100)}"
+        nutrition = f"100 g: {nutrition_summary(food['nutrients'])}"
     return f"{name_line}\n{style(nutrition, DIM)}"
 
 
-def choose_measure(food: dict, suggested_id: str) -> dict | None:
+def choose_measure(food: dict, suggested_id: str, food_name: str) -> dict | None:
     # The website's suggested serving goes first. sorted keeps the rest in Cronometer's order.
     measures = sorted(food["measures"], key=lambda measure: measure["id"] != suggested_id)
     width = max(len(measure["name"]) for measure in measures)
@@ -826,7 +911,8 @@ def choose_measure(food: dict, suggested_id: str) -> dict | None:
     for measure in measures:
         details = f"{round(measure['grams'], 1):g} g · {food['nutrients'].get(CALORIES, 0) * measure['grams'] / 100:.0f} kcal"
         labels.append(f"{measure['name']:<{width}}  {style(details, DIM)}")
-    result = pick(labels, "Serving size: ↑/↓ move, enter chooses, q cancels", dict.fromkeys((*ENTER_KEYS, b" "), "choose"))
+    hint = f"Serving size of {food_name}: ↑/↓ move, enter chooses, q goes back"
+    result = pick(labels, hint, dict.fromkeys((*ENTER_KEYS, b" "), "choose"))
     return measures[result[1]] if result else None
 
 
@@ -845,7 +931,12 @@ def ask_amount(measure_name: str) -> float:
 def save_searched_food(config: dict, request: str, food_name: str) -> None:
     foods = config.setdefault("foods", {})
     suggested = re.sub(r"[^a-z0-9]+", "-", food_name.lower()).strip("-")
-    name = input(f"Save as [{suggested}]: ").strip() or suggested
+    while True:
+        name = input(f"Save as [{suggested}]: ").strip() or suggested
+        # crono log reads NAME:AMOUNT, and the shell splits names at spaces.
+        if name and not re.search(r"[\s:]", name):
+            break
+        print("Use a name without spaces or colons, such as cafe-latte.")
     if name in foods and input(f"{name} is already saved. Replace it? [y/N]: ").strip().lower() != "y":
         print("Canceled.")
         return
@@ -854,96 +945,88 @@ def save_searched_food(config: dict, request: str, food_name: str) -> None:
     print(f"Saved {name}. Log it with: crono log {name}")
 
 
-def remember_food_name(food_id: str, name: str) -> None:
-    """Store the name so unlog does not need an export to look it up."""
-    names = read_json(FOOD_NAMES_PATH, {})
-    if names.get(food_id) != name:
-        names[food_id] = name
-        write_json(FOOD_NAMES_PATH, names)
-
-
 def cmd_search(args) -> None:
     config = read_json(CONFIG_PATH, {})
     session = open_session(config)
     query = " ".join(args.query)
-    hits = session.search_foods(query)
-    if not hits:
-        raise CronoError(f"No foods found for {query}.")
-    foods = session.foods([str(hit["id"]) for hit in hits])
     saved = saved_names_by_food(config.get("foods", {}))
+    hint = "↑/↓ move, enter or space logs, tab saves (or unsaves a saved food), q quits"
+    actions = {**dict.fromkeys((*ENTER_KEYS, b" "), "log"), b"\t": "save"}
+    limit, searched_limit, cursor, foods = SEARCH_RESULTS, 0, 0, {}
+    while True:
+        if searched_limit != limit:
+            hits = session.search_foods(query, limit)
+            if not hits:
+                raise CronoError(f"No foods found for {query}.")
+            foods.update(session.foods([str(hit["id"]) for hit in hits if str(hit["id"]) not in foods]))
+            searched_limit = limit
+        labels = [search_label(hit, foods[str(hit["id"])], saved.get(str(hit["id"]), [])) for hit in hits]
+        # A full page suggests the search has more.
+        if len(hits) == limit:
+            labels.append(style("Show more results", CYAN))
+        result = pick(labels, hint, actions, cursor=cursor)
+        if not result:
+            print("Canceled.")
+            return
+        action, cursor, _ = result
+        if cursor == len(hits):
+            limit += SEARCH_RESULTS
+            continue
+        hit = hits[cursor]
+        food_id, food = str(hit["id"]), foods[str(hit["id"])]
+        if action == "save" and saved.get(food_id):
+            for name in saved[food_id]:
+                del config["foods"][name]
+            write_json(CONFIG_PATH, config)
+            print(f"Deleted {', '.join(saved[food_id])}.")
+            return
+        if not (food and food["measures"]):
+            print(f"Cronometer sent no serving sizes for {hit['name']}. Choose another food.")
+            continue
+        measure = choose_measure(food, str(hit["measureId"]), hit["name"])
+        if measure:
+            break
 
-    labels = [search_label(hit, foods[str(hit["id"])], saved.get(str(hit["id"]), [])) for hit in hits]
-    hint = "↑/↓ move, enter or space logs, tab saves (or unsaves a saved food), q cancels"
-    result = pick(labels, hint, {**dict.fromkeys((*ENTER_KEYS, b" "), "log"), b"\t": "save"})
-    if not result:
-        print("Canceled.")
-        return
-    action, index, _ = result
-    hit = hits[index]
-    food_id, food = str(hit["id"]), foods[str(hit["id"])]
-    if action == "save" and saved.get(food_id):
-        for name in saved[food_id]:
-            del config["foods"][name]
-        write_json(CONFIG_PATH, config)
-        print(f"Deleted {', '.join(saved[food_id])}.")
-        return
-    if not (food and food["measures"]):
-        raise CronoError(f"Cronometer sent no serving sizes for {hit['name']}.")
-
-    print(style(hit["name"], BOLD))
-    measure = choose_measure(food, str(hit["measureId"]))
-    if not measure:
-        print("Canceled.")
-        return
     amount = ask_amount(measure["name"])
     grams = amount * measure["grams"]
     request = new_add_request(food_id, measure["id"], grams, args.date)
-    remember_food_name(food_id, hit["name"])
     if action == "save":
         save_searched_food(config, request, hit["name"])
         return
     meal = chosen_meal(args, config)
     log_foods(session, [(f"{amount:g} × {measure['name']} of {hit['name']}", request)], args.date, meal)
-    print(style(nutrition_summary(food["nutrients"], grams), DIM))
+    print(style(nutrition_summary(scaled(food["nutrients"], grams)), DIM))
+    print_day_total(session, args.date)
 
 
 def style(text: str, *codes: int) -> str:
-    return f"\033[{';'.join(map(str, codes))}m{text}\033[0m" if USE_COLOR else text
-
-
-def short_amount(amount: str) -> str:
-    """Drop the export's trailing zeros: '1.00 can' becomes '1 can'."""
-    number, _, unit = amount.partition(" ")
-    try:
-        return f"{float(number):g} {unit}".strip()
-    except ValueError:
-        return amount
+    return f"\033[{';'.join(map(str, codes))}m{text}\033[0m" if USE_COLOR and codes else text
 
 
 def cmd_diary(args) -> None:
     session = open_session(read_json(CONFIG_PATH, {}))
-    servings = session.export("servings", args.date, "Food Name")
+    entries = session.day_entries(args.date)
     print(style(f"{args.date:%A, %B} {args.date.day}", BOLD))
-    if not servings:
+    if not entries:
         print(style("Nothing logged.", DIM))
         return
-    # The servings export has no nutrition columns, so only the day's total
-    # calories are available, from the daily summary export.
-    summary = session.export("dailySummary", args.date, "Energy (kcal)")
 
-    by_group: dict[str, list[dict]] = {}
-    for serving in servings:
-        by_group.setdefault(serving["Group"], []).append(serving)
-    name_width = max(len(serving["Food Name"]) for serving in servings)
-    for group, group_servings in by_group.items():
-        print(f"\n{style(group, BOLD, CYAN)}")
-        for serving in group_servings:
-            print(f"  {serving['Food Name']:<{name_width}}  {style(short_amount(serving['Amount']), DIM)}")
-    if summary:
-        calories = float(summary[0]["Energy (kcal)"] or 0)
-        caffeine = float(summary[0]["Caffeine (mg)"] or 0)
-        print(f"\n  {style('Total'.ljust(name_width), BOLD)}  {style(f'{calories:.0f} kcal', BOLD)}")
-        print(f"  {style('Caffeine'.ljust(name_width), BOLD)}  {style(f'{caffeine:.0f} mg', BOLD)}")
+    rows = [(entry["name"], entry["serving"], calories_text(entry["nutrients"])) for entry in entries]
+    group = None
+    for entry, line in zip(entries, table(rows, [(), (DIM,), ()], shrink=0, room=room_after(2))):
+        if entry["group"] != group:
+            group = entry["group"]
+            print(f"\n{style(group_name(group), BOLD, CYAN)}")
+        print(f"  {line}")
+
+    total = add_up([entry["nutrients"] for entry in entries if entry["nutrients"] is not None])
+    width = shutil.get_terminal_size().columns if sys.stdout.isatty() else 10**6
+    print()
+    print(fit(f"  {style('Total   ', BOLD)}  {macros_summary(total)}", width))
+    print(f"  {style('Caffeine', BOLD)}  {total.get(CAFFEINE, 0):.0f} mg")
+    unread = sum(entry["nutrients"] is None for entry in entries)
+    if unread:
+        print(style(f"  The total leaves out {unread} {'entry' if unread == 1 else 'entries'} Cronometer sent no details for.", DIM))
 
 
 def cmd_undo(args) -> None:
@@ -1016,30 +1099,45 @@ def cmd_meals(args) -> None:
     print(style("Foods logged today without a meal flag go to the meal that started last.", DIM))
 
 
+DATE_FORMATS = "today, yesterday, a weekday such as mon, -N for N days ago, or YYYY-MM-DD"
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
 def parse_day(text: str) -> date:
-    if text == "today":
-        return date.today()
-    if text == "yesterday":
-        return date.today() - timedelta(days=1)
+    """A day as DATE_FORMATS lists. A weekday means the latest one, so mon on a Monday is today."""
+    today, word = date.today(), text.strip().lower()
+    if word == "today":
+        return today
+    if word == "yesterday":
+        return today - timedelta(days=1)
+    if re.fullmatch(r"-\d{1,4}", word):
+        return today - timedelta(days=int(word[1:]))
+    weekday = next((number for number, name in enumerate(WEEKDAYS) if len(word) >= 3 and name.startswith(word)), None)
+    if weekday is not None:
+        return today - timedelta(days=(today.weekday() - weekday) % 7)
     try:
-        return date.fromisoformat(text)
+        return date.fromisoformat(word)
     except ValueError:
-        raise argparse.ArgumentTypeError("use YYYY-MM-DD, today, or yesterday") from None
+        raise argparse.ArgumentTypeError(f"use {DATE_FORMATS}") from None
 
 
-SAVE_HELP = """\
-Save a food you just added in the Cronometer website:
-  1. Open https://cronometer.com/#diary with DevTools open on the Network tab.
-  2. Add the food the normal way, with the serving size you want. Any meal is
-     fine: crono log sets the meal each time.
-  3. Find the request named "app" whose payload contains updateDiary.
-  4. Right-click it, then Copy > Copy as cURL (or copy the raw request payload).
-  5. Run: crono save NAME
-"""
+def is_date(text: str) -> bool:
+    """Whether text is a day as -D takes it, leaving out weekdays: sun could as well be a search word."""
+    if any(name.startswith(text.strip().lower()) for name in WEEKDAYS):
+        return False
+    try:
+        parse_day(text)
+        return True
+    except argparse.ArgumentTypeError:
+        return False
+
+
+def add_date(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("-D", "--date", type=parse_day, default=date.today(), metavar="DATE", help=DATE_FORMATS)
 
 
 def add_date_and_meal(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("-D", "--date", type=parse_day, default=date.today(), help="YYYY-MM-DD, today, or yesterday")
+    add_date(parser)
     meals = parser.add_mutually_exclusive_group()
     for flag, meal in (("-b", 1), ("-l", 2), ("-d", 3), ("-s", 4), ("-u", 0)):
         name = DIARY_GROUPS[meal]
@@ -1051,20 +1149,15 @@ def add_date_and_meal(parser: argparse.ArgumentParser) -> None:
 def main() -> None:
     # Cookies, the session, and the config are readable only by this user.
     os.umask(0o077)
-    parser = argparse.ArgumentParser(prog="crono", description="Log saved Cronometer foods.")
-    commands = parser.add_subparsers(required=True, metavar="COMMAND")
+    parser = argparse.ArgumentParser(
+        prog="crono", description="Log foods to Cronometer from the terminal. With no command, show today's diary."
+    )
+    # With no command, crono shows today's diary.
+    parser.set_defaults(run=cmd_diary, date=date.today())
+    commands = parser.add_subparsers(metavar="COMMAND")
 
     login = commands.add_parser("login", help="save your Cronometer login in the Keychain")
     login.set_defaults(run=cmd_login)
-
-    save = commands.add_parser(
-        "save",
-        help="save the add-food request in your clipboard",
-        description=SAVE_HELP,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    save.add_argument("name", help="short name to log it by, such as americano")
-    save.set_defaults(run=cmd_save)
 
     list_foods = commands.add_parser("list", help="list saved foods")
     list_foods.add_argument("--names", action="store_true", help="print only the names, one per line")
@@ -1075,7 +1168,9 @@ def main() -> None:
     delete.set_defaults(run=cmd_delete)
 
     log = commands.add_parser("log", help="log saved foods, or show the diary when given none")
-    log.add_argument("foods", nargs="*", metavar="NAME", help="saved foods to log. With none, show the diary.")
+    log.add_argument(
+        "foods", nargs="*", metavar="NAME", help="saved foods to log, with an optional amount (beef-curry:0.5). With none, show the diary."
+    )
     add_date_and_meal(log)
     log.set_defaults(run=cmd_log)
 
@@ -1085,11 +1180,11 @@ def main() -> None:
     search.set_defaults(run=cmd_search)
 
     diary = commands.add_parser("diary", help="show what is logged for a day")
-    diary.add_argument("-D", "--date", type=parse_day, default=date.today(), help="YYYY-MM-DD, today, or yesterday")
+    add_date(diary)
     diary.set_defaults(run=cmd_diary)
 
     unlog = commands.add_parser("unlog", help="choose entries logged on a day and remove them")
-    unlog.add_argument("-D", "--date", type=parse_day, default=date.today(), help="YYYY-MM-DD, today, or yesterday")
+    add_date(unlog)
     unlog.set_defaults(run=cmd_unlog)
 
     undo = commands.add_parser("undo", help="remove the foods from the last log")
@@ -1101,7 +1196,13 @@ def main() -> None:
     meal_times.add_argument("--off", action="store_true", help="stop picking meals by time")
     meal_times.set_defaults(run=cmd_meals)
 
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    if argv[:1] in (["log"], ["search"]):
+        # -d is Dinner. Left alone, the date after it would be read as a food name or a search word.
+        for flag, following in zip(argv, argv[1:]):
+            if flag in ("-d", "--dinner") and is_date(following):
+                sys.exit(f"crono: {flag} means Dinner. Set the date with -D, as in -D {following}.")
+    args = parser.parse_args(argv)
     try:
         args.run(args)
     except CronoError as error:

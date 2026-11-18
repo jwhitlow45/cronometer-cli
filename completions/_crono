@@ -5,7 +5,6 @@
 _crono() {
   local -a commands=(
     'login:save your Cronometer login in the Keychain'
-    'save:save the add-food request in your clipboard'
     'list:list saved foods'
     'delete:delete saved foods'
     'log:log saved foods, or show the diary when given none'
@@ -28,7 +27,7 @@ _crono() {
   [[ $command == (log|delete) ]] && foods=(${(f)"$(_call_program foods crono list --names 2>/dev/null)"})
   local meals='(-b --breakfast -l --lunch -d --dinner -s --snacks -u --uncategorized)'
   local -a date_and_meal=(
-    '(-D --date)'{-D,--date}'[day to log]:date:(today yesterday)'
+    '(-D --date)'{-D,--date}'[day to log]:date:(today yesterday mon tue wed thu fri sat sun)'
     "$meals"{-b,--breakfast}'[log to Breakfast]'
     "$meals"{-l,--lunch}'[log to Lunch]'
     "$meals"{-d,--dinner}'[log to Dinner]'
@@ -53,7 +52,7 @@ _crono() {
         '--off[stop picking meals by time]'
       ;;
     diary|unlog)
-      _arguments '(-D --date)'{-D,--date}'[day]:date:(today yesterday)'
+      _arguments '(-D --date)'{-D,--date}'[day]:date:(today yesterday mon tue wed thu fri sat sun)'
       ;;
     *)
       return 1
