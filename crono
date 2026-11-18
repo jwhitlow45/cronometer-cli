@@ -335,11 +335,18 @@ GWT_CLASS = re.compile(r"[\w.$]+/\d+")
 
 
 def refusal_reason(response: str) -> str:
-    """A readable reason from a GWT-RPC error, which names the exception's class and usually has a message."""
+    """A readable reason from a refused GWT-RPC request.
+
+    An exception response (//EX) names the exception's class and usually has a
+    message. A diary change refused inside an OK response carries other strings,
+    such as food names, so only its error class is shown.
+    """
     strings = string_table(response)
-    message = next((text for text in strings if text and not GWT_CLASS.fullmatch(text)), None)
-    exception = next((text.rsplit(".", 1)[-1].split("/")[0] for text in strings if GWT_CLASS.fullmatch(text)), None)
-    return (message or exception or response[:200]).rstrip(".")
+    classes = [text.rsplit(".", 1)[-1].split("/")[0] for text in strings if GWT_CLASS.fullmatch(text)]
+    error = next((name for name in classes if "Error" in name or "Exception" in name), None)
+    is_exception = response.startswith("//EX")
+    message = next((text for text in strings if text and not GWT_CLASS.fullmatch(text)), None) if is_exception else None
+    return (message or error or response[:200] or "no reason given").rstrip(".")
 
 
 def serving_id_from(response: str) -> str | None:
@@ -430,6 +437,9 @@ class Cronometer:
             raise HttpError(f"{url.split('?')[0]} returned HTTP {error.code}: {body}", error.code) from None
         except urllib.error.URLError as error:
             raise CronoError(f"Could not reach Cronometer: {error.reason}") from None
+        # A timeout while reading the response comes through bare, not as a URLError.
+        except (TimeoutError, ConnectionError) as error:
+            raise CronoError(f"Could not reach Cronometer: {error or 'timed out'}") from None
 
     def refresh_build(self) -> None:
         """Pick up the current web app build. Every Cronometer deploy changes both hashes.
@@ -1143,15 +1153,33 @@ def parse_day(text: str) -> date:
         raise argparse.ArgumentTypeError(f"use {DATE_FORMATS}") from None
 
 
-def is_date(text: str) -> bool:
-    """Whether text is a day as -D takes it, leaving out weekdays: sun could as well be a search word."""
-    if any(name.startswith(text.strip().lower()) for name in WEEKDAYS):
-        return False
+def is_day(text: str) -> bool:
     try:
         parse_day(text)
         return True
     except argparse.ArgumentTypeError:
         return False
+
+
+def misplaced_date(argv: list[str]) -> str | None:
+    """A day typed after -d, which is Dinner, when it was surely meant for -D.
+
+    diary and unlog take no meal, so any day after -d there is a date. search
+    skips weekdays, since sun could as well be a search word, and log skips
+    words that start a saved food's name.
+    """
+    command = argv[0] if argv else None
+    if command not in ("log", "search", "diary", "unlog"):
+        return None
+    foods = read_json(CONFIG_PATH, {}).get("foods", {}) if command == "log" else {}
+    for flag, following in zip(argv, argv[1:]):
+        if flag not in ("-d", "--dinner") or not is_day(following):
+            continue
+        is_weekday = any(name.startswith(following.strip().lower()) for name in WEEKDAYS)
+        starts_saved_name = any(name.startswith(following) for name in foods)
+        if command in ("diary", "unlog") or (command == "search" and not is_weekday) or (command == "log" and not starts_saved_name):
+            return following
+    return None
 
 
 def add_date(parser: argparse.ArgumentParser) -> None:
@@ -1219,11 +1247,10 @@ def main() -> None:
     meal_times.set_defaults(run=cmd_meals)
 
     argv = sys.argv[1:]
-    if argv[:1] in (["log"], ["search"]):
-        # -d is Dinner. Left alone, the date after it would be read as a food name or a search word.
-        for flag, following in zip(argv, argv[1:]):
-            if flag in ("-d", "--dinner") and is_date(following):
-                sys.exit(f"crono: {flag} means Dinner. Set the date with -D, as in -D {following}.")
+    # Left alone, a date after -d would be logged as a food, searched for, or rejected as an unknown argument.
+    day = misplaced_date(argv)
+    if day:
+        sys.exit(f"crono: -d means Dinner. Set the date with -D, as in -D {day}.")
     args = parser.parse_args(argv)
     try:
         args.run(args)
