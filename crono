@@ -1,0 +1,1115 @@
+#!/usr/bin/env python3
+"""Log saved Cronometer foods from the terminal.
+
+Cronometer has no public API for personal accounts. Its web app talks to the
+server over GWT-RPC, so this tool logs in the way the website does and replays
+the "add food" request the web app sent when the food was first added by hand.
+Replaying the browser's own request keeps the serving size, unit, and diary
+group exactly as the website records them, without decoding every field.
+
+The login flow, build hash lookup, and the authenticate and removeServing
+payloads follow github.com/cphoskins/cronometer-mcp (MIT license).
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta
+from fractions import Fraction
+from http.cookiejar import LWPCookieJar
+from pathlib import Path
+
+KEYCHAIN_SERVICE = "cronometer-cli"
+CONFIG_PATH = Path.home() / ".config" / "crono" / "config.json"
+STATE_DIR = Path.home() / ".local" / "state" / "crono"
+COOKIES_PATH = STATE_DIR / "cookies.txt"
+SESSION_PATH = STATE_DIR / "session.json"
+LAST_LOG_PATH = STATE_DIR / "last-log.json"
+# Food names by Cronometer food id. Looking one up costs an export, which Cronometer throttles.
+FOOD_NAMES_PATH = STATE_DIR / "food-names.json"
+
+SITE = "https://cronometer.com"
+MODULE_BASE = f"{SITE}/cronometer/"
+RPC_URL = f"{SITE}/cronometer/app"
+SERVICE = "com.cronometer.shared.rpc.CronometerService"
+STRING_TYPE = "java.lang.String/2004016611"
+DAY_TYPE = "com.cronometer.shared.entries.models.Day/782579793"
+TIME_TYPE = "com.cronometer.shared.entries.models.Time/1552252503"
+DAY_TYPE_PREFIX = "com.cronometer.shared.entries.models.Day/"
+TIME_TYPE_PREFIX = "com.cronometer.shared.entries.models.Time/"
+# Cronometer's default meal (diary group) names by number. An account can rename
+# them in its settings, and crono does not read those names.
+DIARY_GROUPS = {0: "Uncategorized", 1: "Breakfast", 2: "Lunch", 3: "Dinner", 4: "Snacks"}
+# Nutrient ids in Cronometer's food data, which follow USDA numbering.
+CALORIES, CARBS, PROTEIN, FAT, CAFFEINE = 208, 205, 203, 204, 262
+SEARCH_RESULTS = 15
+USER_AGENT = "crono-cli"
+TIMEOUT_SECONDS = 30
+
+BOLD, DIM, CYAN = 1, 2, 36
+# Color only for a person at a terminal, and never when NO_COLOR is set (no-color.org).
+USE_COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+# A GWT-RPC request body, on its own or inside "Copy as cURL" output.
+RPC_BODY_PATTERN = re.compile(r"7\|0\|\d+\|https://cronometer\.com/cronometer/\|[^'\"\s]*\|")
+
+
+class CronoError(Exception):
+    pass
+
+
+class HttpError(CronoError):
+    def __init__(self, message: str, code: int):
+        super().__init__(message)
+        self.code = code
+
+
+# GWT-RPC requests
+
+
+def parse_rpc(body: str) -> tuple[list[str], list[str]]:
+    """Split a GWT-RPC request into its string table and payload tokens.
+
+    GWT escapes any "|" inside a string, so splitting on "|" is safe.
+    """
+    parts = body.split("|")
+    count = int(parts[2])
+    return parts[3 : 3 + count], parts[3 + count : -1]
+
+
+def join_rpc(strings: list[str], tokens: list[str]) -> str:
+    return "|".join(["7", "0", str(len(strings)), *strings, *tokens]) + "|"
+
+
+def as_date(fields: list[str]) -> date | None:
+    try:
+        day, month, year = (int(field) for field in fields)
+        return date(year, month, day) if 2000 <= year <= 2100 else None
+    except ValueError:
+        return None
+
+
+def locate_add_fields(strings: list[str], tokens: list[str]) -> dict:
+    """Find the session nonce, user id, date, and meal in an updateDiary request.
+
+    The payload opens with refs to the module base, policy hash, service, and
+    method, then the parameter count, the parameter type refs, and the values.
+    updateDiary takes the session nonce first and the user id second. The
+    serving's date is a Day object: its type ref, then day, month, and year.
+    Six places after the day is a number that holds the meal in its high 16
+    bits and the food's unit (can, cup, and so on) in its low 16 bits.
+    """
+    if len(strings) < 4 or strings[3] != "updateDiary":
+        raise CronoError("That request is not an updateDiary request.")
+    param_count = int(tokens[4])
+    first_value = 5 + param_count
+    param_types = [strings[int(ref) - 1] for ref in tokens[5:first_value]]
+    if param_types[:2] != [STRING_TYPE, "I"]:
+        raise CronoError(f"Unexpected updateDiary parameters: {param_types}")
+
+    day_ref = next((str(i + 1) for i, s in enumerate(strings) if s.startswith(DAY_TYPE_PREFIX)), None)
+    date_starts = [
+        position + 1
+        for position in range(first_value + 2, len(tokens) - 3)
+        if tokens[position] == day_ref and as_date(tokens[position + 1 : position + 4])
+    ]
+    if len(date_starts) != 1:
+        raise CronoError("Expected exactly one food in the request. Add one food at a time while capturing.")
+    meal_and_unit = date_starts[0] + 6
+    if not tokens[meal_and_unit].isdigit():
+        raise CronoError(f"Unexpected serving in the request: {tokens[date_starts[0] : meal_and_unit + 1]}")
+    return {
+        "nonce": int(tokens[first_value]) - 1,
+        "user_id": first_value + 1,
+        "date": date_starts[0],
+        "meal_and_unit": meal_and_unit,
+        "food_id": date_starts[0] + 10,
+    }
+
+
+def new_add_request(food_id: str, measure_id: str, grams: float, day: date) -> str:
+    """An add-food request for a food found by search, in the same layout as the website's.
+
+    Like a saved request, it leaves the session values blank for fill_add_request.
+    The serving's amount is its weight in grams. Cronometer shows it in the
+    chosen measure.
+    """
+    strings = [
+        MODULE_BASE, "", SERVICE, "updateDiary", STRING_TYPE, "I", "java.util.List", "",
+        "java.util.Collections$SingletonList/1586180994",
+        "com.cronometer.shared.entries.changes.AddEntryChange/3949104564",
+        "com.cronometer.shared.entries.models.Serving/2895043750",
+        DAY_TYPE,
+    ]
+    tokens = [
+        "1", "2", "3", "4", "3", "5", "6", "7", "8", "0", "9", "10", "1", "1", "11", "12",
+        str(day.day), str(day.month), str(day.year), "1", "1", "0", "1", "0", "0",
+        str(round(grams, 3)), food_id, "A", measure_id, "0",
+    ]
+    return join_rpc(strings, tokens)
+
+
+def fill_add_request(saved: str, *, policy_hash: str, nonce: str, user_id: str, day: date, meal: int) -> str:
+    strings, tokens = parse_rpc(saved)
+    fields = locate_add_fields(strings, tokens)
+    strings[1] = policy_hash
+    strings[fields["nonce"]] = nonce
+    tokens[fields["user_id"]] = user_id
+    start = fields["date"]
+    tokens[start : start + 3] = [str(day.day), str(day.month), str(day.year)]
+    unit = int(tokens[fields["meal_and_unit"]]) & 0xFFFF
+    tokens[fields["meal_and_unit"]] = str(meal << 16 | unit)
+    return join_rpc(strings, tokens)
+
+
+def authenticate_body(policy_hash: str, utc_offset_minutes: int) -> str:
+    return (
+        f"7|0|5|{MODULE_BASE}|{policy_hash}|{SERVICE}|authenticate|java.lang.Integer/3438268394|"
+        f"1|2|3|4|1|5|5|{utc_offset_minutes}|"
+    )
+
+
+def remove_serving_body(policy_hash: str, nonce: str, serving_id: str, user_id: str) -> str:
+    return (
+        f"7|0|8|{MODULE_BASE}|{policy_hash}|{SERVICE}|removeServing|{STRING_TYPE}|J|I|{nonce}|"
+        f"1|2|3|4|3|5|6|7|8|{serving_id}|{user_id}|"
+    )
+
+
+def export_token_body(policy_hash: str, nonce: str, user_id: str) -> str:
+    # Asks for a token that lasts 3600 seconds. The final 2 picks the token's
+    # scope, and is the value the reference client sends for exports.
+    return (
+        f"7|0|8|{MODULE_BASE}|{policy_hash}|{SERVICE}|generateAuthorizationToken|{STRING_TYPE}|I|"
+        f"com.cronometer.shared.user.AuthScope/2065601159|{nonce}|1|2|3|4|4|5|6|6|7|8|{user_id}|3600|7|2|"
+    )
+
+
+def get_servings_body(policy_hash: str, nonce: str, user_id: str, day: date) -> str:
+    # getServings takes a first and last day, then a start and end time. No times means the whole day.
+    day_object = f"7|{day.day}|{day.month}|{day.year}"
+    return (
+        f"7|0|9|{MODULE_BASE}|{policy_hash}|{SERVICE}|getServings|{STRING_TYPE}|I|{DAY_TYPE}|{TIME_TYPE}|{nonce}|"
+        f"1|2|3|4|6|5|6|7|7|8|8|9|{user_id}|{day_object}|{day_object}|0|0|"
+    )
+
+
+def get_food_body(policy_hash: str, nonce: str, food_id: str) -> str:
+    return f"7|0|7|{MODULE_BASE}|{policy_hash}|{SERVICE}|getFood|{STRING_TYPE}|I|{nonce}|1|2|3|4|2|5|6|7|{food_id}|"
+
+
+def string_table(response: str) -> list[str]:
+    """The strings a GWT-RPC response refers to, which it sends as its last JSON array."""
+    try:
+        return json.loads(response[response.rfind(',["') + 1 : response.rfind("],") + 1])
+    except ValueError:
+        return []
+
+
+def reading_tokens(response: str) -> list[str]:
+    """The values of a GWT-RPC response in the order they are read, which is backwards."""
+    return response[len("//OK[") : response.rfind(',["')].split(",")[::-1]
+
+
+def class_ref(table: list[str], class_name: str) -> str | None:
+    """The ref a response uses for a class, such as Measure for com.cronometer.shared.foods.models.Measure/1979099908."""
+    return next((str(i + 1) for i, name in enumerate(table) if name.rsplit(".", 1)[-1].startswith(class_name + "/")), None)
+
+
+def food_from(response: str, food_id: str) -> dict:
+    """Read a food's serving sizes and its nutrients per 100 g from a getFood response.
+
+    In reading order, a serving size (class Measure, or DerivedMeasure for
+    generic sizes like cup and ml) is its class ref, then its amount, a flag,
+    the food id, a flag, its own id, its volume in ml, and its name. The volume
+    is 0 when the food has none, and otherwise a boxed number: a class ref and
+    the value. The weight in grams is the next decimal number after the name. A
+    nutrient is its class ref, then its amount per 100 g, then its nutrient id.
+    """
+    table = string_table(response)
+    tokens = reading_tokens(response)
+    measure_refs = {class_ref(table, "Measure"), class_ref(table, "DerivedMeasure")} - {None}
+    nutrient_ref = class_ref(table, "Nutrient")
+    measures = []
+    try:
+        for position, token in enumerate(tokens):
+            if token in measure_refs and tokens[position + 3] == food_id:
+                volume = tokens[position + 6]
+                name_at = position + 7 if volume == "0" or volume.startswith("-") else position + 8
+                grams = next(float(value) for value in tokens[name_at + 1 :] if "." in value)
+                amount, name = float(tokens[position + 1]), table[int(tokens[name_at]) - 1]
+                label = name if amount == 1 else f"{amount:g} {name}".strip()
+                measures.append({"id": tokens[position + 5], "name": label or "serving", "grams": grams})
+        nutrients = {
+            int(tokens[position + 2]): float(tokens[position + 1])
+            for position, token in enumerate(tokens)
+            if token == nutrient_ref and "." in tokens[position + 1]
+        }
+    except (ValueError, IndexError, StopIteration):
+        raise CronoError(f"Could not read food {food_id}: {response[:200]}") from None
+    return {"measures": measures, "nutrients": nutrients}
+
+
+def nutrition_summary(per_100_grams: dict[int, float], grams: float) -> str:
+    amount = {nutrient: value * grams / 100 for nutrient, value in per_100_grams.items()}
+    parts = [f"{amount.get(CALORIES, 0):.0f} kcal"]
+    parts += [f"{round(amount.get(nutrient, 0), 1):g} g {name}" for nutrient, name in ((CARBS, "carbs"), (PROTEIN, "protein"), (FAT, "fat"))]
+    if round(amount.get(CAFFEINE, 0)):
+        parts.append(f"{amount[CAFFEINE]:.0f} mg caffeine")
+    return " · ".join(parts)
+
+
+def servings_from(response: str) -> list[dict]:
+    """Read the entries in a getServings response.
+
+    GWT writes a response backwards, and sends longs as quoted strings. Each
+    entry's id is its only long. In reading order, the entry's food id comes just
+    before its id, its grams before that, and five places before the id is a
+    number whose high 16 bits are the entry's diary group.
+    """
+    tokens = reading_tokens(response)
+    entries = []
+    try:
+        for position, token in enumerate(tokens):
+            if token.startswith('"'):
+                entries.append({
+                    "serving_id": token.strip('"'),
+                    "food_id": str(int(tokens[position - 1])),
+                    "grams": float(tokens[position - 2]),
+                    "group": int(tokens[position - 5]) >> 16,
+                })
+        expected = int(tokens[1])
+    except (ValueError, IndexError):
+        raise CronoError(f"Could not read the day's entries: {response[:200]}") from None
+    if len(entries) != expected:
+        raise CronoError(f"Read {len(entries)} of the day's {expected} entries. Cronometer may have changed.")
+    return entries
+
+
+def serving_id_from(response: str) -> str | None:
+    """Read the new serving's id from an updateDiary response.
+
+    GWT sends longs as quoted base64 strings. In the responses seen so far, the
+    serving id is the only long before the string table. Anything else returns
+    None, and undo then asks for removal in the web app.
+    """
+    data = response[len("//OK[") : response.find('["')]
+    longs = re.findall(r'"([^"]+)"', data)
+    return longs[0] if len(longs) == 1 else None
+
+
+def utc_offset_minutes() -> int:
+    # authenticate takes the browser's UTC offset in minutes. The reference
+    # client sends -300, which is US Central daylight time.
+    return int(datetime.now().astimezone().utcoffset().total_seconds() // 60)
+
+
+# Local files and the Keychain
+
+
+def read_json(path: Path, default):
+    return json.loads(path.read_text()) if path.exists() else default
+
+
+def write_json(path: Path, value) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2) + "\n")
+
+
+def keychain_password(email: str) -> str:
+    result = subprocess.run(
+        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", email, "-w"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise CronoError("No saved password. Run: crono login")
+    return result.stdout.rstrip("\n")
+
+
+# The web session
+
+
+class Cronometer:
+    """A logged-in web session. Cookies and build hashes persist between runs."""
+
+    def __init__(self, email: str):
+        self.email = email
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self.cookies = LWPCookieJar(COOKIES_PATH)
+        if COOKIES_PATH.exists():
+            self.cookies.load(ignore_discard=True, ignore_expires=True)
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookies))
+        state = read_json(SESSION_PATH, {})
+        self.user_id = state.get("user_id")
+        self.permutation = state.get("permutation")
+        self.policy_hash = state.get("policy_hash")
+        self.refresh_build()
+
+    @property
+    def nonce(self) -> str | None:
+        # Some calls rotate the sesnonce cookie, so read it fresh for every request.
+        values = [cookie.value for cookie in self.cookies if cookie.name == "sesnonce"]
+        return values[-1] if values else None
+
+    def save(self) -> None:
+        self.cookies.save(ignore_discard=True, ignore_expires=True)
+        write_json(
+            SESSION_PATH,
+            {"user_id": self.user_id, "permutation": self.permutation, "policy_hash": self.policy_hash},
+        )
+
+    def fetch(self, url: str, data: str | None = None, headers: dict | None = None) -> str:
+        request = urllib.request.Request(
+            url,
+            data=None if data is None else data.encode(),
+            headers={"User-Agent": USER_AGENT, **(headers or {})},
+        )
+        try:
+            with self.opener.open(request, timeout=TIMEOUT_SECONDS) as response:
+                return response.read().decode()
+        except urllib.error.HTTPError as error:
+            body = error.read().decode(errors="replace")[:300]
+            # The query string can hold a one-time export token.
+            raise HttpError(f"{url.split('?')[0]} returned HTTP {error.code}: {body}", error.code) from None
+        except urllib.error.URLError as error:
+            raise CronoError(f"Could not reach Cronometer: {error.reason}") from None
+
+    def refresh_build(self) -> None:
+        """Pick up the current web app build. Every Cronometer deploy changes both hashes.
+
+        The permutation goes in a request header. The serialization policy hash
+        goes in every request body, and only the compiled app script names it.
+        """
+        bootstrap = self.fetch(f"{MODULE_BASE}cronometer.nocache.js")
+        permutation = re.search(r"='([A-F0-9]{32})'", bootstrap)
+        if not permutation:
+            raise CronoError("Could not find the web app build in cronometer.nocache.js.")
+        if permutation.group(1) == self.permutation and self.policy_hash:
+            return
+        compiled = self.fetch(f"{MODULE_BASE}{permutation.group(1)}.cache.js")
+        policy_hash = re.search(r"'app','([A-F0-9]{32})'", compiled)
+        if not policy_hash:
+            raise CronoError("Could not find the RPC policy hash in the web app script.")
+        self.permutation, self.policy_hash = permutation.group(1), policy_hash.group(1)
+        self.save()
+
+    def login(self) -> None:
+        password = keychain_password(self.email)
+        # With a stale session cookie, /login/ serves a page without the anti-CSRF token.
+        self.cookies.clear()
+        page = self.fetch(f"{SITE}/login/")
+        anticsrf = re.search(r'name="anticsrf"\s+value="([^"]+)"', page)
+        if not anticsrf:
+            raise CronoError("Could not find the anti-CSRF token on the login page.")
+        form = urllib.parse.urlencode({"anticsrf": anticsrf.group(1), "username": self.email, "password": password})
+        result = json.loads(self.fetch(f"{SITE}/login", form, {"Content-Type": "application/x-www-form-urlencoded"}))
+        if result.get("error") or not (result.get("success") or result.get("redirect")):
+            raise CronoError(f"Login failed: {result.get('error') or result}")
+        if not self.nonce:
+            raise CronoError("Login succeeded, but Cronometer sent no session nonce.")
+
+        response = self.post_rpc(authenticate_body(self.policy_hash, utc_offset_minutes()))
+        user_id = re.match(r"//OK\[(\d+),", response)
+        if not user_id:
+            raise CronoError(f"Could not read the user id: {response[:200]}")
+        self.user_id = user_id.group(1)
+        self.save()
+
+    def post_rpc(self, body: str) -> str:
+        return self.fetch(
+            RPC_URL,
+            body,
+            {
+                "Content-Type": "text/x-gwt-rpc; charset=UTF-8",
+                "X-GWT-Module-Base": MODULE_BASE,
+                "X-GWT-Permutation": self.permutation,
+            },
+        )
+
+    def rpc(self, build_body) -> str:
+        """Send a request built from the current session, logging in again once if it expired."""
+        if not (self.user_id and self.nonce):
+            self.login()
+        response = self.post_rpc(build_body())
+        if response.startswith("//EX") and "NotLoggedInException" in response:
+            self.login()
+            response = self.post_rpc(build_body())
+        self.save()
+        if response.startswith("//OK") and "ErrorEntryChangeResult" not in response:
+            return response
+        hint = (
+            " Cronometer changed its web app, so saved foods may need saving again."
+            if "IncompatibleRemoteServiceException" in response
+            else ""
+        )
+        raise CronoError(f"Cronometer rejected the request: {response[:300]}{hint}")
+
+    def add_serving(self, saved_request: str, day: date, meal: int) -> str | None:
+        response = self.rpc(
+            lambda: fill_add_request(
+                saved_request, policy_hash=self.policy_hash, nonce=self.nonce, user_id=self.user_id, day=day, meal=meal
+            )
+        )
+        return serving_id_from(response)
+
+    def remove_serving(self, serving_id: str) -> None:
+        self.rpc(lambda: remove_serving_body(self.policy_hash, self.nonce, serving_id, self.user_id))
+
+    def export(self, kind: str, day: date, required_column: str) -> list[dict]:
+        """One day of a Cronometer CSV export, such as servings or dailySummary.
+
+        Each export needs a new token: Cronometer refuses a token that was already used.
+        """
+        response = self.rpc(lambda: export_token_body(self.policy_hash, self.nonce, self.user_id))
+        token = re.search(r'"([^"]+)"', response)
+        if not token:
+            raise CronoError(f"Could not read the export token: {response[:200]}")
+        query = urllib.parse.urlencode(
+            {"nonce": token.group(1), "generate": kind, "start": day.isoformat(), "end": day.isoformat()}
+        )
+        exported = self.fetch(f"{SITE}/export?{query}")
+        rows = list(csv.DictReader(io.StringIO(exported)))
+        if rows and required_column not in rows[0]:
+            raise CronoError(f"Unexpected {kind} export from Cronometer: {exported[:200]}")
+        return rows
+
+    def search_foods(self, query: str) -> list[dict]:
+        """The website's food search, best match first."""
+        if not (self.user_id and self.nonce):
+            self.login()
+        params = urllib.parse.urlencode(
+            {"query": query.upper(), "maxResults": SEARCH_RESULTS, "sources": "All", "categoryId": 0, "selectedTab": "ALL", "type": "All"}
+        )
+        for attempt in range(2):
+            try:
+                return json.loads(self.fetch(f"{SITE}/api/v3/user/{self.user_id}/food-search/string?{params}"))
+            except HttpError as error:
+                if attempt or error.code not in (401, 403):
+                    raise
+                self.login()
+
+    def foods(self, food_ids: list[str]) -> dict[str, dict | None]:
+        """Serving sizes and nutrients for each food, or None for a food Cronometer would not send.
+
+        The first food goes through rpc, which logs in again if the session
+        expired. The rest are fetched side by side so a search stays quick.
+        """
+        def read(food_id: str, response: str) -> dict | None:
+            try:
+                return food_from(response, food_id) if response.startswith("//OK") else None
+            except CronoError:
+                return None
+
+        def fetch_food(food_id: str, body: str) -> tuple[str, dict | None]:
+            try:
+                return food_id, read(food_id, self.post_rpc(body))
+            except CronoError:
+                return food_id, None
+
+        if not food_ids:
+            return {}
+        first, rest = food_ids[0], food_ids[1:]
+        try:
+            found = {first: read(first, self.rpc(lambda: get_food_body(self.policy_hash, self.nonce, first)))}
+        except HttpError:
+            raise
+        except CronoError:
+            found = {first: None}
+        # Bodies are built here, because reading the nonce while other threads store cookies is unsafe.
+        bodies = [get_food_body(self.policy_hash, self.nonce, food_id) for food_id in rest]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            found.update(pool.map(fetch_food, rest, bodies))
+        self.save()
+        return found
+
+    def day_servings(self, day: date) -> list[dict]:
+        response = self.rpc(lambda: get_servings_body(self.policy_hash, self.nonce, self.user_id, day))
+        return servings_from(response)
+
+    def food_names(self, day: date, food_ids: list[str]) -> dict[str, str]:
+        """Names for the foods in the day's diary, looking up the ones crono has not seen before.
+
+        getFood answers with every string about a food (translations, measures,
+        and more) and no fixed place for its name. So the name is the one string
+        it shares with the day's servings export.
+        """
+        names = read_json(FOOD_NAMES_PATH, {})
+        missing = [food_id for food_id in dict.fromkeys(food_ids) if food_id not in names]
+        if missing:
+            diary_names = {row["Food Name"] for row in self.export("servings", day, "Food Name")}
+            for food_id in missing:
+                response = self.rpc(lambda: get_food_body(self.policy_hash, self.nonce, food_id))
+                matches = diary_names.intersection(string_table(response))
+                if len(matches) == 1:
+                    names[food_id] = matches.pop()
+            write_json(FOOD_NAMES_PATH, names)
+        return names
+
+
+def open_session(config: dict) -> Cronometer:
+    if not config.get("email"):
+        raise CronoError("Not logged in. Run: crono login")
+    return Cronometer(config["email"])
+
+
+# Commands
+
+
+def cmd_login(args) -> None:
+    config = read_json(CONFIG_PATH, {})
+    saved_email = config.get("email")
+    email = input(f"Cronometer email{f' [{saved_email}]' if saved_email else ''}: ").strip() or saved_email
+    if not email:
+        raise CronoError("An email is required.")
+    print("Enter your Cronometer password. It is stored in the macOS Keychain.")
+    stored = subprocess.run(["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", email, "-w"])
+    if stored.returncode != 0:
+        raise CronoError("Could not save the password to the Keychain.")
+    config["email"] = email
+    write_json(CONFIG_PATH, config)
+    for path in (COOKIES_PATH, SESSION_PATH):
+        path.unlink(missing_ok=True)
+    Cronometer(email).login()
+    print("Logged in.")
+
+
+def cmd_save(args) -> None:
+    from_stdin = not sys.stdin.isatty()
+    text = sys.stdin.read() if from_stdin else subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
+    requests = [body for body in RPC_BODY_PATTERN.findall(text) if parse_rpc(body)[0][3:4] == ["updateDiary"]]
+    if len(requests) != 1:
+        raise CronoError(
+            "Expected one updateDiary request in the clipboard, found "
+            f"{len(requests)}. In DevTools, copy the 'app' request whose payload contains updateDiary."
+        )
+
+    strings, tokens = parse_rpc(requests[0])
+    fields = locate_add_fields(strings, tokens)
+    start = fields["date"]
+    captured_on = as_date(tokens[start : start + 3])
+    # The nonce is a live session secret. Every replay fills in the current one.
+    strings[fields["nonce"]] = ""
+
+    config = read_json(CONFIG_PATH, {})
+    config.setdefault("foods", {})[args.name] = {"request": join_rpc(strings, tokens), "captured_on": captured_on.isoformat()}
+    write_json(CONFIG_PATH, config)
+    if not from_stdin:
+        # "Copy as cURL" includes the session cookies.
+        subprocess.run(["pbcopy"], input="", text=True)
+        print("Cleared the clipboard, since it held your session cookies.")
+    print(f"Saved {args.name}.")
+    if any(s.startswith(TIME_TYPE_PREFIX) for s in strings):
+        print("Note: this request includes a time of day. Every log of it will use that same time.")
+
+
+def cmd_list(args) -> None:
+    foods = read_json(CONFIG_PATH, {}).get("foods", {})
+    if args.names:
+        print("\n".join(sorted(foods)))
+        return
+    if not foods:
+        print("No saved foods. See: crono save --help")
+    for name, food in sorted(foods.items()):
+        print(f"{name}  (saved {food['captured_on']})")
+
+
+def require_saved(foods: dict, names: list[str]) -> None:
+    unknown = [name for name in names if name not in foods]
+    if unknown:
+        raise CronoError(f"No saved food named {', '.join(unknown)}. Saved: {', '.join(sorted(foods)) or 'none'}")
+
+
+def cmd_delete(args) -> None:
+    config = read_json(CONFIG_PATH, {})
+    foods = config.get("foods", {})
+    require_saved(foods, args.names)
+    names = list(dict.fromkeys(args.names))
+    for name in names:
+        del foods[name]
+    write_json(CONFIG_PATH, config)
+    print(f"Deleted {', '.join(names)}.")
+
+
+def cmd_log(args) -> None:
+    if not args.foods:
+        cmd_diary(args)
+        return
+    config = read_json(CONFIG_PATH, {})
+    foods = config.get("foods", {})
+    require_saved(foods, args.foods)
+    for name in args.foods:
+        locate_add_fields(*parse_rpc(foods[name]["request"]))
+    session = open_session(config)
+    meal = chosen_meal(args, config)
+    log_foods(session, [(name, foods[name]["request"]) for name in args.foods], args.date, meal)
+
+
+def log_foods(session: Cronometer, foods: list[tuple[str, str]], day: date, meal: int) -> None:
+    """Log each (description, request) pair, and record the entries so undo can remove them."""
+    meal_name = DIARY_GROUPS[meal]
+    logged = []
+    try:
+        for description, request in foods:
+            serving_id = session.add_serving(request, day, meal)
+            if serving_id:
+                logged.append({"name": description, "serving_id": serving_id})
+                print(f"Logged {description} to {meal_name} on {day}.")
+            else:
+                print(f"Logged {description} to {meal_name} on {day}, but Cronometer sent no entry id, so undo cannot remove it.")
+    finally:
+        write_json(LAST_LOG_PATH, {"date": day.isoformat(), "servings": logged})
+
+
+def remove_entries(session: Cronometer, entries: list[dict], day: str) -> None:
+    """Remove diary entries, and drop each from the last log so undo does not try it again."""
+    for entry in entries:
+        session.remove_serving(entry["serving_id"])
+        last_log = read_json(LAST_LOG_PATH, None)
+        if last_log:
+            last_log["servings"] = [kept for kept in last_log["servings"] if kept["serving_id"] != entry["serving_id"]]
+            write_json(LAST_LOG_PATH, last_log)
+        print(f"Unlogged {entry['name']} from {day}.")
+
+
+ANSI_ESCAPE = re.compile(r"(\033\[[0-9;?]*[A-Za-z])")
+ENTER_KEYS = (b"\n", b"\r")
+
+
+def fit(line: str, width: int) -> str:
+    """Cut a line to the terminal width, counting only visible characters.
+
+    A line that wraps would throw off the picker, which redraws by moving up a
+    fixed number of lines.
+    """
+    kept, room = [], width - 1
+    for part in ANSI_ESCAPE.split(line):
+        if ANSI_ESCAPE.fullmatch(part):
+            kept.append(part)
+        elif len(part) <= room:
+            kept.append(part)
+            room -= len(part)
+        else:
+            kept.append(part[: max(room - 1, 0)] + "…" + ("\033[0m" if USE_COLOR else ""))
+            break
+    return "".join(kept)
+
+
+def pick(labels: list[str], hint: str, actions: dict[bytes, str], multiple: bool = False) -> tuple[str, int, list[int]] | None:
+    """Show labels as a list to move through with the arrow keys (or j and k).
+
+    A key in actions ends the choice. It returns that key's action, the
+    highlighted index, and, when multiple is set, the indexes toggled with
+    space. q or Escape cancels and returns None. Labels may span lines, and the
+    list scrolls when it is taller than the terminal. The list is erased once
+    the choice is made.
+    """
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raise CronoError("Choosing needs a terminal.")
+    import termios
+    import tty
+
+    label_lines = [label.split("\n") for label in labels]
+    height = max(len(lines) for lines in label_lines)
+    terminal = shutil.get_terminal_size()
+    visible = max(1, min(len(labels), (terminal.lines - 3) // height))
+    frame_lines = visible * height + 2
+    indent = " " * (6 if multiple else 2)
+    cursor, top, chosen = 0, 0, set()
+
+    def draw() -> None:
+        sys.stdout.write("\033[2K" + fit(style(hint, DIM), terminal.columns) + "\n")
+        for index in range(top, top + visible):
+            pointer = style(">", BOLD, CYAN) if index == cursor else " "
+            box = (style("[x]", CYAN) if index in chosen else "[ ]") + " " if multiple else ""
+            lines = label_lines[index] + [""] * (height - len(label_lines[index]))
+            for number, line in enumerate(lines):
+                prefix = f"{pointer} {box}" if number == 0 else indent
+                sys.stdout.write("\033[2K" + fit(prefix + line, terminal.columns) + "\n")
+        position = f"{cursor + 1} of {len(labels)}" if len(labels) > visible else ""
+        sys.stdout.write("\033[2K" + style(position, DIM) + "\n")
+        sys.stdout.flush()
+
+    fd = sys.stdin.fileno()
+    terminal_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.write("\033[?25l")
+        draw()
+        while True:
+            key = os.read(fd, 3)
+            if key in (b"\x1b[A", b"k"):
+                cursor = (cursor - 1) % len(labels)
+            elif key in (b"\x1b[B", b"j"):
+                cursor = (cursor + 1) % len(labels)
+            elif key == b" " and multiple:
+                chosen ^= {cursor}
+            elif key in actions:
+                return actions[key], cursor, sorted(chosen)
+            elif key in (b"q", b"\x1b"):
+                return None
+            top = min(max(top, cursor - visible + 1), cursor)
+            # Move back to the hint line and draw over the list.
+            sys.stdout.write(f"\033[{frame_lines}F")
+            draw()
+    finally:
+        sys.stdout.write(f"\033[{frame_lines}F\033[J\033[?25h")
+        sys.stdout.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, terminal_settings)
+
+
+def cmd_unlog(args) -> None:
+    session = open_session(read_json(CONFIG_PATH, {}))
+    entries = session.day_servings(args.date)
+    if not entries:
+        raise CronoError(f"Nothing logged on {args.date}.")
+    names = session.food_names(args.date, [entry["food_id"] for entry in entries])
+    for entry in entries:
+        entry["name"] = names.get(entry["food_id"], f"Food {entry['food_id']}")
+    entries.sort(key=lambda entry: entry["group"])
+
+    name_width = max(len(entry["name"]) for entry in entries)
+    labels = []
+    for entry in entries:
+        group = DIARY_GROUPS.get(entry["group"], f"Group {entry['group'] + 1}")
+        details = f"{group}, {round(entry['grams'], 1):g} g"
+        labels.append(f"{entry['name']:<{name_width}}  {style(details, DIM)}")
+    hint = "↑/↓ move, space selects, enter unlogs, q cancels"
+    result = pick(labels, hint, dict.fromkeys(ENTER_KEYS, "unlog"), multiple=True)
+    if not result:
+        print("Canceled.")
+        return
+    _, cursor, chosen = result
+    remove_entries(session, [entries[index] for index in chosen or [cursor]], args.date.isoformat())
+
+
+def saved_names_by_food(foods: dict) -> dict[str, list[str]]:
+    by_food: dict[str, list[str]] = {}
+    for name, food in sorted(foods.items()):
+        strings, tokens = parse_rpc(food["request"])
+        by_food.setdefault(tokens[locate_add_fields(strings, tokens)["food_id"]], []).append(name)
+    return by_food
+
+
+def search_label(hit: dict, food: dict | None, saved_as: list[str]) -> str:
+    """Two lines: the food's name and source, then its nutrition for the website's suggested serving."""
+    name_line = f"{hit['name']}  {style(hit['source'], DIM)}"
+    if saved_as:
+        name_line += "  " + style(f"saved as {', '.join(saved_as)}", CYAN)
+    if not food:
+        return f"{name_line}\n{style('nutrition unavailable', DIM)}"
+    serving = next((measure for measure in food["measures"] if measure["id"] == str(hit["measureId"])), None)
+    if serving:
+        nutrition = f"{hit['measureDisplayName']}: {nutrition_summary(food['nutrients'], serving['grams'])}"
+    else:
+        nutrition = f"100 g: {nutrition_summary(food['nutrients'], 100)}"
+    return f"{name_line}\n{style(nutrition, DIM)}"
+
+
+def choose_measure(food: dict, suggested_id: str) -> dict | None:
+    # The website's suggested serving goes first. sorted keeps the rest in Cronometer's order.
+    measures = sorted(food["measures"], key=lambda measure: measure["id"] != suggested_id)
+    width = max(len(measure["name"]) for measure in measures)
+    labels = []
+    for measure in measures:
+        details = f"{round(measure['grams'], 1):g} g · {food['nutrients'].get(CALORIES, 0) * measure['grams'] / 100:.0f} kcal"
+        labels.append(f"{measure['name']:<{width}}  {style(details, DIM)}")
+    result = pick(labels, "Serving size: ↑/↓ move, enter chooses, q cancels", dict.fromkeys((*ENTER_KEYS, b" "), "choose"))
+    return measures[result[1]] if result else None
+
+
+def ask_amount(measure_name: str) -> float:
+    while True:
+        text = input(f"Amount ({measure_name}) [1]: ").strip() or "1"
+        try:
+            amount = Fraction(text)
+        except (ValueError, ZeroDivisionError):
+            amount = 0
+        if amount > 0:
+            return float(amount)
+        print("Enter a number above 0, such as 1, 1.5, or 1/2.")
+
+
+def save_searched_food(config: dict, request: str, food_name: str) -> None:
+    foods = config.setdefault("foods", {})
+    suggested = re.sub(r"[^a-z0-9]+", "-", food_name.lower()).strip("-")
+    name = input(f"Save as [{suggested}]: ").strip() or suggested
+    if name in foods and input(f"{name} is already saved. Replace it? [y/N]: ").strip().lower() != "y":
+        print("Canceled.")
+        return
+    foods[name] = {"request": request, "captured_on": date.today().isoformat()}
+    write_json(CONFIG_PATH, config)
+    print(f"Saved {name}. Log it with: crono log {name}")
+
+
+def remember_food_name(food_id: str, name: str) -> None:
+    """Store the name so unlog does not need an export to look it up."""
+    names = read_json(FOOD_NAMES_PATH, {})
+    if names.get(food_id) != name:
+        names[food_id] = name
+        write_json(FOOD_NAMES_PATH, names)
+
+
+def cmd_search(args) -> None:
+    config = read_json(CONFIG_PATH, {})
+    session = open_session(config)
+    query = " ".join(args.query)
+    hits = session.search_foods(query)
+    if not hits:
+        raise CronoError(f"No foods found for {query}.")
+    foods = session.foods([str(hit["id"]) for hit in hits])
+    saved = saved_names_by_food(config.get("foods", {}))
+
+    labels = [search_label(hit, foods[str(hit["id"])], saved.get(str(hit["id"]), [])) for hit in hits]
+    hint = "↑/↓ move, enter or space logs, tab saves (or unsaves a saved food), q cancels"
+    result = pick(labels, hint, {**dict.fromkeys((*ENTER_KEYS, b" "), "log"), b"\t": "save"})
+    if not result:
+        print("Canceled.")
+        return
+    action, index, _ = result
+    hit = hits[index]
+    food_id, food = str(hit["id"]), foods[str(hit["id"])]
+    if action == "save" and saved.get(food_id):
+        for name in saved[food_id]:
+            del config["foods"][name]
+        write_json(CONFIG_PATH, config)
+        print(f"Deleted {', '.join(saved[food_id])}.")
+        return
+    if not (food and food["measures"]):
+        raise CronoError(f"Cronometer sent no serving sizes for {hit['name']}.")
+
+    print(style(hit["name"], BOLD))
+    measure = choose_measure(food, str(hit["measureId"]))
+    if not measure:
+        print("Canceled.")
+        return
+    amount = ask_amount(measure["name"])
+    grams = amount * measure["grams"]
+    request = new_add_request(food_id, measure["id"], grams, args.date)
+    remember_food_name(food_id, hit["name"])
+    if action == "save":
+        save_searched_food(config, request, hit["name"])
+        return
+    meal = chosen_meal(args, config)
+    log_foods(session, [(f"{amount:g} × {measure['name']} of {hit['name']}", request)], args.date, meal)
+    print(style(nutrition_summary(food["nutrients"], grams), DIM))
+
+
+def style(text: str, *codes: int) -> str:
+    return f"\033[{';'.join(map(str, codes))}m{text}\033[0m" if USE_COLOR else text
+
+
+def short_amount(amount: str) -> str:
+    """Drop the export's trailing zeros: '1.00 can' becomes '1 can'."""
+    number, _, unit = amount.partition(" ")
+    try:
+        return f"{float(number):g} {unit}".strip()
+    except ValueError:
+        return amount
+
+
+def cmd_diary(args) -> None:
+    session = open_session(read_json(CONFIG_PATH, {}))
+    servings = session.export("servings", args.date, "Food Name")
+    print(style(f"{args.date:%A, %B} {args.date.day}", BOLD))
+    if not servings:
+        print(style("Nothing logged.", DIM))
+        return
+    # The servings export has no nutrition columns, so only the day's total
+    # calories are available, from the daily summary export.
+    summary = session.export("dailySummary", args.date, "Energy (kcal)")
+
+    by_group: dict[str, list[dict]] = {}
+    for serving in servings:
+        by_group.setdefault(serving["Group"], []).append(serving)
+    name_width = max(len(serving["Food Name"]) for serving in servings)
+    for group, group_servings in by_group.items():
+        print(f"\n{style(group, BOLD, CYAN)}")
+        for serving in group_servings:
+            print(f"  {serving['Food Name']:<{name_width}}  {style(short_amount(serving['Amount']), DIM)}")
+    if summary:
+        calories = float(summary[0]["Energy (kcal)"] or 0)
+        caffeine = float(summary[0]["Caffeine (mg)"] or 0)
+        print(f"\n  {style('Total'.ljust(name_width), BOLD)}  {style(f'{calories:.0f} kcal', BOLD)}")
+        print(f"  {style('Caffeine'.ljust(name_width), BOLD)}  {style(f'{caffeine:.0f} mg', BOLD)}")
+
+
+def cmd_undo(args) -> None:
+    last_log = read_json(LAST_LOG_PATH, None)
+    if not (last_log and last_log["servings"]):
+        raise CronoError("Nothing to undo.")
+    session = open_session(read_json(CONFIG_PATH, {}))
+    remove_entries(session, list(last_log["servings"]), last_log["date"])
+
+
+MEAL_TIME_NAMES = {"breakfast": 1, "lunch": 2, "dinner": 3}
+
+
+def meal_at(times: dict[str, str], now: datetime) -> int:
+    """The meal whose start time came last before now.
+
+    Each meal lasts until the next one starts, so before the first start time
+    of the day it is still the last meal of the day before.
+    """
+    starts = sorted((time, MEAL_TIME_NAMES[name]) for name, time in times.items())
+    started = [meal for time, meal in starts if time <= now.strftime("%H:%M")]
+    return started[-1] if started else starts[-1][1]
+
+
+def chosen_meal(args, config: dict) -> int:
+    """The meal flag, or else the meal for the time of day, or else uncategorized.
+
+    The time of day picks a meal only when logging for today: the time now
+    says nothing about which meal an entry on another day was.
+    """
+    if args.meal is not None:
+        return args.meal
+    times = config.get("meal_times")
+    return meal_at(times, datetime.now()) if times and args.date == date.today() else 0
+
+
+def parse_time(text: str) -> str:
+    """Read a time such as 7, 7:30, 17:30, or 5pm, as HH:MM in 24-hour time."""
+    match = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*([ap]m)?", text.strip().lower())
+    if match:
+        hour, minute, half = int(match[1]), int(match[2] or 0), match[3]
+        if half and 1 <= hour <= 12:
+            hour = hour % 12 + (12 if half == "pm" else 0)
+        elif half:
+            hour = 24
+        if hour < 24 and minute < 60:
+            return f"{hour:02}:{minute:02}"
+    raise argparse.ArgumentTypeError("use a time such as 7, 7:30, 17:30, or 5pm")
+
+
+def cmd_meals(args) -> None:
+    config = read_json(CONFIG_PATH, {})
+    times = dict(config.get("meal_times", {}))
+    if args.off:
+        times = {}
+    times.update({name: getattr(args, name) for name in MEAL_TIME_NAMES if getattr(args, name)})
+    if times != config.get("meal_times", {}):
+        if times:
+            config["meal_times"] = times
+        else:
+            config.pop("meal_times", None)
+        write_json(CONFIG_PATH, config)
+
+    if not times:
+        print("No meal times set, so foods logged without a meal flag are uncategorized.")
+        print("Set them with: crono meals -b 7:00 -l 11:30 -d 17:00")
+        return
+    for name, time in sorted(times.items(), key=lambda item: item[1]):
+        print(f"{name.capitalize():<10} {datetime.strptime(time, '%H:%M'):%-I:%M %p}")
+    print(style("Foods logged today without a meal flag go to the meal that started last.", DIM))
+
+
+def parse_day(text: str) -> date:
+    if text == "today":
+        return date.today()
+    if text == "yesterday":
+        return date.today() - timedelta(days=1)
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("use YYYY-MM-DD, today, or yesterday") from None
+
+
+SAVE_HELP = """\
+Save a food you just added in the Cronometer website:
+  1. Open https://cronometer.com/#diary with DevTools open on the Network tab.
+  2. Add the food the normal way, with the serving size you want. Any meal is
+     fine: crono log sets the meal each time.
+  3. Find the request named "app" whose payload contains updateDiary.
+  4. Right-click it, then Copy > Copy as cURL (or copy the raw request payload).
+  5. Run: crono save NAME
+"""
+
+
+def add_date_and_meal(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("-D", "--date", type=parse_day, default=date.today(), help="YYYY-MM-DD, today, or yesterday")
+    meals = parser.add_mutually_exclusive_group()
+    for flag, meal in (("-b", 1), ("-l", 2), ("-d", 3), ("-s", 4), ("-u", 0)):
+        name = DIARY_GROUPS[meal]
+        meals.add_argument(flag, f"--{name.lower()}", dest="meal", action="store_const", const=meal, help=f"log to {name}")
+    # No flag leaves the choice to the meal times set with crono meals.
+    parser.set_defaults(meal=None)
+
+
+def main() -> None:
+    # Cookies, the session, and the config are readable only by this user.
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(prog="crono", description="Log saved Cronometer foods.")
+    commands = parser.add_subparsers(required=True, metavar="COMMAND")
+
+    login = commands.add_parser("login", help="save your Cronometer login in the Keychain")
+    login.set_defaults(run=cmd_login)
+
+    save = commands.add_parser(
+        "save",
+        help="save the add-food request in your clipboard",
+        description=SAVE_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    save.add_argument("name", help="short name to log it by, such as americano")
+    save.set_defaults(run=cmd_save)
+
+    list_foods = commands.add_parser("list", help="list saved foods")
+    list_foods.add_argument("--names", action="store_true", help="print only the names, one per line")
+    list_foods.set_defaults(run=cmd_list)
+
+    delete = commands.add_parser("delete", help="delete saved foods")
+    delete.add_argument("names", nargs="+", metavar="NAME")
+    delete.set_defaults(run=cmd_delete)
+
+    log = commands.add_parser("log", help="log saved foods, or show the diary when given none")
+    log.add_argument("foods", nargs="*", metavar="NAME", help="saved foods to log. With none, show the diary.")
+    add_date_and_meal(log)
+    log.set_defaults(run=cmd_log)
+
+    search = commands.add_parser("search", help="search Cronometer's foods to log or save one")
+    search.add_argument("query", nargs="+", metavar="WORD")
+    add_date_and_meal(search)
+    search.set_defaults(run=cmd_search)
+
+    diary = commands.add_parser("diary", help="show what is logged for a day")
+    diary.add_argument("-D", "--date", type=parse_day, default=date.today(), help="YYYY-MM-DD, today, or yesterday")
+    diary.set_defaults(run=cmd_diary)
+
+    unlog = commands.add_parser("unlog", help="choose entries logged on a day and remove them")
+    unlog.add_argument("-D", "--date", type=parse_day, default=date.today(), help="YYYY-MM-DD, today, or yesterday")
+    unlog.set_defaults(run=cmd_unlog)
+
+    undo = commands.add_parser("undo", help="remove the foods from the last log")
+    undo.set_defaults(run=cmd_undo)
+
+    meal_times = commands.add_parser("meals", help="show or set the times that pick a meal when no meal flag is given")
+    for flag, name in (("-b", "breakfast"), ("-l", "lunch"), ("-d", "dinner")):
+        meal_times.add_argument(flag, f"--{name}", type=parse_time, metavar="TIME", help=f"when {name} starts, such as 7:00 or 7am")
+    meal_times.add_argument("--off", action="store_true", help="stop picking meals by time")
+    meal_times.set_defaults(run=cmd_meals)
+
+    args = parser.parse_args()
+    try:
+        args.run(args)
+    except CronoError as error:
+        sys.exit(f"crono: {error}")
+    except (KeyboardInterrupt, EOFError):
+        print()
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,64 @@
+#compdef crono
+
+# Completes crono's commands, and saved food names for "crono log".
+
+_crono() {
+  local -a commands=(
+    'login:save your Cronometer login in the Keychain'
+    'save:save the add-food request in your clipboard'
+    'list:list saved foods'
+    'delete:delete saved foods'
+    'log:log saved foods, or show the diary when given none'
+    'search:search Cronometer foods to log or save one'
+    'diary:show what is logged for a day'
+    'unlog:choose entries logged on a day and remove them'
+    'undo:remove the foods from the last log'
+    'meals:show or set the times that pick a meal when no meal flag is given'
+  )
+  if (( CURRENT == 2 )); then
+    _describe command commands
+    return
+  fi
+
+  local command=$words[2]
+  # Drop "crono" so _arguments reads the subcommand as the command name.
+  shift words
+  (( CURRENT-- ))
+  local -a foods
+  [[ $command == (log|delete) ]] && foods=(${(f)"$(_call_program foods crono list --names 2>/dev/null)"})
+  local meals='(-b --breakfast -l --lunch -d --dinner -s --snacks -u --uncategorized)'
+  local -a date_and_meal=(
+    '(-D --date)'{-D,--date}'[day to log]:date:(today yesterday)'
+    "$meals"{-b,--breakfast}'[log to Breakfast]'
+    "$meals"{-l,--lunch}'[log to Lunch]'
+    "$meals"{-d,--dinner}'[log to Dinner]'
+    "$meals"{-s,--snacks}'[log to Snacks]'
+    "$meals"{-u,--uncategorized}'[log to Uncategorized]'
+  )
+  case $command in
+    log)
+      _arguments $date_and_meal '*:saved food:compadd -a foods'
+      ;;
+    search)
+      _arguments $date_and_meal '*:search words: '
+      ;;
+    delete)
+      _arguments '*:saved food:compadd -a foods'
+      ;;
+    meals)
+      _arguments \
+        '(-b --breakfast)'{-b,--breakfast}'[when breakfast starts]:time: ' \
+        '(-l --lunch)'{-l,--lunch}'[when lunch starts]:time: ' \
+        '(-d --dinner)'{-d,--dinner}'[when dinner starts]:time: ' \
+        '--off[stop picking meals by time]'
+      ;;
+    diary|unlog)
+      _arguments '(-D --date)'{-D,--date}'[day]:date:(today yesterday)'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+_crono "$@"
