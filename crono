@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import http.client
 import json
 import os
 import re
@@ -437,9 +438,9 @@ class Cronometer:
             raise HttpError(f"{url.split('?')[0]} returned HTTP {error.code}: {body}", error.code) from None
         except urllib.error.URLError as error:
             raise CronoError(f"Could not reach Cronometer: {error.reason}") from None
-        # A timeout while reading the response comes through bare, not as a URLError.
-        except (TimeoutError, ConnectionError) as error:
-            raise CronoError(f"Could not reach Cronometer: {error or 'timed out'}") from None
+        # Errors while reading the response, such as a timeout, come through bare, not as a URLError.
+        except (OSError, http.client.HTTPException) as error:
+            raise CronoError(f"Could not reach Cronometer: {str(error) or type(error).__name__}") from None
 
     def refresh_build(self) -> None:
         """Pick up the current web app build. Every Cronometer deploy changes both hashes.
@@ -649,9 +650,12 @@ def saved_parts(name: str, food: dict) -> tuple[str, str, float]:
         strings, tokens = parse_rpc(food["request"])
         fields = locate_add_fields(strings, tokens)
         return tokens[fields["food_id"]], tokens[fields["measure_id"]], float(tokens[fields["grams"]])
-    except (CronoError, ValueError, IndexError) as error:
+    except CronoError as error:
         reason = str(error).rstrip(".")
-        raise CronoError(f"Cannot read the saved food {name} ({reason}). Delete it with: crono delete {name}") from None
+    # A hand-edited or damaged config can hold anything here.
+    except (ValueError, IndexError, KeyError, TypeError, AttributeError):
+        reason = "it is not a request crono can read"
+    raise CronoError(f"Cannot read the saved food {name} ({reason}). Delete it with: crono delete {name}")
 
 
 def cmd_list(args) -> None:
@@ -824,7 +828,7 @@ def fit(line: str, width: int) -> str:
 
 
 def pick(
-    labels: list[str], hint: str, actions: dict[bytes, str], multiple: bool = False, cursor: int = 0
+    labels: list[str], hint: str, actions: dict[bytes, str], multiple: bool = False, cursor: int = 0, top: int | None = None
 ) -> tuple[str, int, list[int]] | None:
     """Show labels as a list to move through with the arrow keys (or j and k).
 
@@ -832,7 +836,9 @@ def pick(
     highlighted index, and, when multiple is set, the indexes toggled with
     space. q or Escape cancels and returns None. Labels may span lines, and the
     list scrolls when it is taller than the terminal. The list is erased once
-    the choice is made. The highlight starts at cursor.
+    the choice is made. The highlight starts at cursor. The list opens with top
+    as its first row when given, and otherwise as far up as keeps the
+    highlight in view.
     """
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         raise CronoError("Choosing needs a terminal.")
@@ -846,8 +852,9 @@ def pick(
     frame_lines = visible * height + 2
     indent = " " * (6 if multiple else 2)
     cursor = min(cursor, len(labels) - 1)
-    # The window opens at the highlight, so after "Show more results" the new rows are in view.
-    top, chosen = max(0, min(cursor, len(labels) - visible)), set()
+    lowest_top = max(0, cursor - visible + 1)
+    top = lowest_top if top is None else min(max(top, lowest_top), cursor, len(labels) - visible)
+    chosen = set()
 
     def draw() -> None:
         sys.stdout.write("\033[2K" + fit(style(hint, DIM), terminal.columns) + "\n")
@@ -985,7 +992,7 @@ def cmd_search(args) -> None:
     saved = saved_names_by_food(config.get("foods", {}))
     hint = "↑/↓ move, enter or space logs, tab saves (or unsaves a saved food), q quits"
     actions = {**dict.fromkeys((*ENTER_KEYS, b" "), "log"), b"\t": "save"}
-    limit, searched_limit, cursor, foods = SEARCH_RESULTS, 0, 0, {}
+    limit, searched_limit, cursor, top, foods = SEARCH_RESULTS, 0, 0, None, {}
     while True:
         if searched_limit != limit:
             hits = session.search_foods(query, limit)
@@ -997,13 +1004,16 @@ def cmd_search(args) -> None:
         # A full page suggests the search has more.
         if len(hits) == limit:
             labels.append(style("Show more results", CYAN))
-        result = pick(labels, hint, actions, cursor=cursor)
+        result = pick(labels, hint, actions, cursor=cursor, top=top)
         if not result:
             print("Canceled.")
             return
         action, cursor, _ = result
+        top = None
         if cursor == len(hits):
             limit += SEARCH_RESULTS
+            # Open the longer list at the first new result, so the new rows are in view.
+            top = cursor
             continue
         hit = hits[cursor]
         food_id, food = str(hit["id"]), foods[str(hit["id"])]
