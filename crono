@@ -728,12 +728,15 @@ def day_label(day: date) -> str:
     return "Today" if day == date.today() else f"{day:%A, %B} {day.day}"
 
 
-def add_up(amounts: list[dict[int, float]]) -> dict[int, float]:
+def day_total(entries: list[dict]) -> tuple[dict[int, float], str]:
+    """The day's nutrients added up, and a note when some entries had no details to add."""
     total: dict[int, float] = {}
-    for amount in amounts:
-        for nutrient, value in amount.items():
+    for entry in entries:
+        for nutrient, value in (entry["nutrients"] or {}).items():
             total[nutrient] = total.get(nutrient, 0) + value
-    return total
+    left_out = sum(entry["nutrients"] is None for entry in entries)
+    note = f"The total leaves out {left_out} {'entry' if left_out == 1 else 'entries'} Cronometer sent no details for."
+    return total, note if left_out else ""
 
 
 def print_day_total(session: Cronometer, day: date) -> None:
@@ -743,8 +746,10 @@ def print_day_total(session: Cronometer, day: date) -> None:
     except CronoError as error:
         print(style(f"Could not read the day's total: {error}", DIM))
         return
-    total = add_up([entry["nutrients"] for entry in entries if entry["nutrients"] is not None])
+    total, note = day_total(entries)
     print(style(f"{day_label(day)}: {macros_summary(total)} · {total.get(CAFFEINE, 0):.0f} mg caffeine", DIM))
+    if note:
+        print(style(note, DIM))
 
 
 def log_foods(session: Cronometer, foods: list[tuple[str, str]], day: date, meal: int) -> None:
@@ -1023,14 +1028,13 @@ def cmd_diary(args) -> None:
             print(f"\n{style(group_name(group), BOLD, CYAN)}")
         print(f"  {line}")
 
-    total = add_up([entry["nutrients"] for entry in entries if entry["nutrients"] is not None])
+    total, note = day_total(entries)
     width = shutil.get_terminal_size().columns if sys.stdout.isatty() else 10**6
     print()
     print(fit(f"  {style('Total   ', BOLD)}  {macros_summary(total)}", width))
     print(f"  {style('Caffeine', BOLD)}  {total.get(CAFFEINE, 0):.0f} mg")
-    unread = sum(entry["nutrients"] is None for entry in entries)
-    if unread:
-        print(style(f"  The total leaves out {unread} {'entry' if unread == 1 else 'entries'} Cronometer sent no details for.", DIM))
+    if note:
+        print(style(f"  {note}", DIM))
 
 
 def cmd_undo(args) -> None:
