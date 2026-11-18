@@ -622,7 +622,7 @@ def table(rows: list[tuple[str, ...]], styles: list[tuple[int, ...]], shrink: in
     widths = [max(len(row[column]) for row in rows) for column in range(len(rows[0]))]
     if room is not None:
         excess = sum(widths) + 2 * (len(widths) - 1) - room
-        widths[shrink] = max(10, widths[shrink] - max(excess, 0))
+        widths[shrink] = max(min(10, widths[shrink]), widths[shrink] - max(excess, 0))
     return [
         "  ".join(style(cut(cell, width).ljust(width), *codes) for cell, width, codes in zip(row, widths, styles))
         for row in rows
@@ -836,7 +836,8 @@ def pick(
     frame_lines = visible * height + 2
     indent = " " * (6 if multiple else 2)
     cursor = min(cursor, len(labels) - 1)
-    top, chosen = max(0, cursor - visible + 1), set()
+    # The window opens at the highlight, so after "Show more results" the new rows are in view.
+    top, chosen = max(0, min(cursor, len(labels) - visible)), set()
 
     def draw() -> None:
         sys.stdout.write("\033[2K" + fit(style(hint, DIM), terminal.columns) + "\n")
@@ -931,7 +932,8 @@ def choose_measure(food: dict, suggested_id: str, food_name: str) -> dict | None
     for measure in measures:
         details = f"{round(measure['grams'], 1):g} g · {food['nutrients'].get(CALORIES, 0) * measure['grams'] / 100:.0f} kcal"
         labels.append(f"{measure['name']:<{width}}  {style(details, DIM)}")
-    hint = f"Serving size of {food_name}: ↑/↓ move, enter chooses, q goes back"
+    # The keys come first so a long food name cannot push them off a narrow terminal.
+    hint = f"Serving size: ↑/↓ move, enter chooses, q goes back · {food_name}"
     result = pick(labels, hint, dict.fromkeys((*ENTER_KEYS, b" "), "choose"))
     return measures[result[1]] if result else None
 
