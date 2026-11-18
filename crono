@@ -633,11 +633,15 @@ def calories_text(nutrients: dict[int, float] | None) -> str:
     return f"{nutrients.get(CALORIES, 0):5.0f} kcal" if nutrients is not None else "    ? kcal"
 
 
-def saved_parts(food: dict) -> tuple[str, str, float]:
-    """A saved food's food id, serving size id, and weight in grams."""
-    strings, tokens = parse_rpc(food["request"])
-    fields = locate_add_fields(strings, tokens)
-    return tokens[fields["food_id"]], tokens[fields["measure_id"]], float(tokens[fields["grams"]])
+def saved_parts(name: str, food: dict) -> tuple[str, str, float]:
+    """A saved food's food id, serving size id, and weight in grams, or an error that names the food."""
+    try:
+        strings, tokens = parse_rpc(food["request"])
+        fields = locate_add_fields(strings, tokens)
+        return tokens[fields["food_id"]], tokens[fields["measure_id"]], float(tokens[fields["grams"]])
+    except (CronoError, ValueError, IndexError) as error:
+        reason = str(error).rstrip(".")
+        raise CronoError(f"Cannot read the saved food {name} ({reason}). Delete it with: crono delete {name}") from None
 
 
 def cmd_list(args) -> None:
@@ -649,7 +653,7 @@ def cmd_list(args) -> None:
     if not foods:
         print("No saved foods. Find one with crono search, then press tab to save it.")
         return
-    parts = {name: saved_parts(food) for name, food in foods.items()}
+    parts = {name: saved_parts(name, food) for name, food in foods.items()}
     details = open_session(config).foods(list(dict.fromkeys(food_id for food_id, _, _ in parts.values())))
     rows = []
     for name in sorted(parts):
@@ -669,6 +673,9 @@ def unknown_food(foods: dict, name: str) -> CronoError:
 
 def resolve_saved(foods: dict, name: str) -> str:
     """A saved food by its name, or by the start of its name when only one saved food starts that way."""
+    if not name:
+        # An empty name starts every saved name, so it would match the only saved food.
+        raise CronoError(f"A food name is empty. Saved: {', '.join(sorted(foods)) or 'none'}.")
     if name in foods:
         return name
     starting = sorted(saved for saved in foods if saved.startswith(name))
@@ -685,13 +692,13 @@ def parse_food_amount(text: str) -> tuple[str, float]:
     if not colon:
         return text, 1.0
     try:
-        times = Fraction(amount)
-    except (ValueError, ZeroDivisionError):
+        times = float(Fraction(amount))
+    except (ValueError, ZeroDivisionError, OverflowError):
         times = 0
     if not name or times <= 0:
         example = name or "americano"
         raise CronoError(f"{text}: put a number above 0 after the colon, as in {example}:2 or {example}:1/2.")
-    return name, float(times)
+    return name, times
 
 
 def cmd_delete(args) -> None:
@@ -717,6 +724,10 @@ def cmd_log(args) -> None:
     for text in args.foods:
         name, times = parse_food_amount(text)
         name = resolve_saved(foods, name)
+        # Reading every saved request here means a broken one stops the log before anything is added.
+        _, _, grams = saved_parts(name, foods[name])
+        if round(grams * times, 3) <= 0:
+            raise CronoError(f"{text} comes to 0 g. Use a larger amount.")
         description = name if times == 1 else f"{times:g} × {name}"
         to_log.append((description, scale_request(foods[name]["request"], times)))
     session = open_session(config)
@@ -925,15 +936,16 @@ def choose_measure(food: dict, suggested_id: str, food_name: str) -> dict | None
     return measures[result[1]] if result else None
 
 
-def ask_amount(measure_name: str) -> float:
+def ask_amount(measure: dict) -> float:
     while True:
-        text = input(f"Amount ({measure_name}) [1]: ").strip() or "1"
+        text = input(f"Amount ({measure['name']}) [1]: ").strip() or "1"
         try:
-            amount = Fraction(text)
-        except (ValueError, ZeroDivisionError):
+            amount = float(Fraction(text))
+        except (ValueError, ZeroDivisionError, OverflowError):
             amount = 0
-        if amount > 0:
-            return float(amount)
+        # The request rounds grams to 3 places, so a tiny amount would log 0 g.
+        if round(amount * measure["grams"], 3) > 0:
+            return amount
         print("Enter a number above 0, such as 1, 1.5, or 1/2.")
 
 
@@ -996,7 +1008,7 @@ def cmd_search(args) -> None:
         if measure:
             break
 
-    amount = ask_amount(measure["name"])
+    amount = ask_amount(measure)
     grams = amount * measure["grams"]
     request = new_add_request(food_id, measure["id"], grams, args.date)
     if action == "save":
