@@ -327,10 +327,12 @@ def food_units(food: dict) -> dict[str, dict]:
     it is logged in, and whether crono converted it rather than read it from
     the food. The food's own serving sizes come first, then kcal, which
     works back from the food's calories and has no serving size of its own.
-    Other mass units convert through the food's mass serving size, preferring
-    g, and only a food with one gets them, since a food people add can give a
-    can a made-up weight such as 100 g. Other volume units convert through
-    the first serving size whose volume crono knows.
+    Other mass units convert through grams, and only a food with a mass
+    serving size gets them, since a food people add can give a can a made-up
+    weight such as 100 g. Other volume units convert through the first
+    serving size whose volume crono knows. A converted mass or volume logs in
+    the food's g serving size, or in the size it converts through when the
+    food has no g size, since 13.7 g reads better than 0.06 cup.
     """
     units: dict[str, dict] = {}
 
@@ -343,17 +345,16 @@ def food_units(food: dict) -> dict[str, dict]:
     calories = food["nutrients"].get(CALORIES, 0)
     if calories > 0:
         add("kcal", 100 / calories, None)
-    by_mass = sorted(
-        (measure for measure in measures if unit_key(measure["unit"]) in MASS_UNITS), key=lambda measure: unit_key(measure["unit"]) != "g"
-    )
+    in_grams = next((measure for measure in measures if unit_key(measure["unit"]) == "g"), None)
+    by_mass = next((measure for measure in measures if unit_key(measure["unit"]) in MASS_UNITS), None)
     if by_mass:
         for name, grams in MASS_UNITS.items():
-            add(name, grams, by_mass[0]["id"])
+            add(name, grams, (in_grams or by_mass)["id"])
     by_volume = next((measure for measure in measures if measure_ml(measure)), None)
     if by_volume:
         grams_per_ml = by_volume["grams"] / measure_ml(by_volume)
         for name, ml in VOLUME_UNITS.items():
-            add(name, ml * grams_per_ml, by_volume["id"])
+            add(name, ml * grams_per_ml, (in_grams or by_volume)["id"])
     return units
 
 
@@ -1077,7 +1078,7 @@ def choose_measure(food: dict, suggested_id: str, food_name: str) -> dict | None
     # The website's suggested serving goes first. sorted keeps the rest in Cronometer's order.
     measures = sorted(food["measures"], key=lambda measure: measure["id"] != suggested_id)
     # Units the food has no serving size for, such as kcal, follow its serving sizes.
-    # kcal logs in the suggested serving size, and other units in the size they convert through.
+    # kcal logs in the suggested serving size, and other units in the food's g size or else the size they convert through.
     units = [
         {"id": unit["measure_id"] or measures[0]["id"], "name": unit["name"], "grams": unit["grams"], "converted": True}
         for unit in food_units(food).values()
