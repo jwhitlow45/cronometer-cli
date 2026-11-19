@@ -17,6 +17,7 @@ import argparse
 import difflib
 import http.client
 import json
+import math
 import os
 import re
 import shutil
@@ -108,8 +109,9 @@ def locate_add_fields(strings: list[str], tokens: list[str]) -> dict:
     updateDiary takes the session nonce first and the user id second. The
     serving's date is a Day object: its type ref, then day, month, and year.
     Six places after the day is a number that holds the meal in its high 16
-    bits and the food's unit (can, cup, and so on) in its low 16 bits. Then
-    come the weight in grams, the food id, and the serving size id.
+    bits. Its low 16 bits are 1, 2, or 3 in saved requests whatever their
+    serving size, so crono keeps them as saved. Then come the weight in
+    grams, the food id, and the serving size id.
     """
     if len(strings) < 4 or strings[3] != "updateDiary":
         raise CronoError("That request is not an updateDiary request.")
@@ -182,8 +184,8 @@ def fill_add_request(saved: str, *, policy_hash: str, nonce: str, user_id: str, 
     tokens[fields["user_id"]] = user_id
     start = fields["date"]
     tokens[start : start + 3] = [str(day.day), str(day.month), str(day.year)]
-    unit = int(tokens[fields["meal_and_unit"]]) & 0xFFFF
-    tokens[fields["meal_and_unit"]] = str(meal << 16 | unit)
+    low_bits = int(tokens[fields["meal_and_unit"]]) & 0xFFFF
+    tokens[fields["meal_and_unit"]] = str(meal << 16 | low_bits)
     return join_rpc(strings, tokens)
 
 
@@ -353,6 +355,11 @@ def food_units(food: dict) -> dict[str, dict]:
         for name, ml in VOLUME_UNITS.items():
             add(name, ml * grams_per_ml, by_volume["id"])
     return units
+
+
+def typeable(unit_name: str) -> bool:
+    # A name that starts with a number would run into the amount typed before it, and NAME:AMOUNT splits at the last colon.
+    return not re.match(r"[\d./]", unit_name) and ":" not in unit_name
 
 
 def find_unit(units: dict[str, dict], typed: str) -> dict | None:
@@ -724,13 +731,13 @@ def cmd_list(args) -> None:
     if args.names:
         print("\n".join(sorted(foods)))
         return
-    if args.units:
+    if args.units is not None:
         name = resolve_saved(foods, args.units)
         food_id, _, _ = saved_parts(name, foods[name])
         food = open_session(config).foods([food_id])[food_id]
         if not food:
             raise CronoError(f"Cronometer sent no details for {name}.")
-        print("\n".join(unit["name"] for unit in food_units(food).values()))
+        print("\n".join(unit["name"] for unit in food_units(food).values() if typeable(unit["name"])))
         return
     if not foods:
         print("No saved foods. Find one with crono search, then press tab to save it.")
@@ -804,10 +811,10 @@ def amount_unit(food: dict | None, text: str, name: str, typed: str) -> dict:
     if found:
         return found
     # Names such as "small or tall - each 12 fl oz" and "cup, mashed" work too, but are too long, or too hard to read, in a list.
-    listed = [unit["name"] for unit in units.values() if re.fullmatch(r"\w+( \w+)?", unit["name"])]
-    raise CronoError(
-        f"{text}: {name} cannot be measured in {typed}. Use a number alone for a multiple of the saved amount, or one of: {', '.join(listed)}."
-    )
+    # The rest are listed as they are typed, without spaces, so fl oz is floz.
+    listed = ["".join(unit["name"].split()) for unit in units.values() if typeable(unit["name"]) and re.fullmatch(r"\w+( \w+)?", unit["name"])]
+    choices = f", or one of: {', '.join(listed)}" if listed else ""
+    raise CronoError(f"{text}: {name} cannot be measured in {typed}. Use a number alone for a multiple of the saved amount{choices}.")
 
 
 def cmd_delete(args) -> None:
@@ -823,6 +830,16 @@ def cmd_delete(args) -> None:
     print(f"Deleted {', '.join(names)}.")
 
 
+def checked_grams(text: str, grams: float) -> float:
+    """The weight an amount comes to, or an error before anything is logged."""
+    if not math.isfinite(grams):
+        raise CronoError(f"{text} is too large an amount.")
+    # The request rounds grams to 3 places, so a tiny amount would log 0 g.
+    if round(grams, 3) <= 0:
+        raise CronoError(f"{text} comes to 0 g. Use a larger amount.")
+    return grams
+
+
 def cmd_log(args) -> None:
     if not args.foods:
         cmd_diary(args)
@@ -834,7 +851,11 @@ def cmd_log(args) -> None:
         name, number, unit = parse_food_amount(text)
         name = resolve_saved(foods, name)
         # Reading every saved request here means a broken one stops the log before anything is added.
-        wanted.append((text, name, number, unit, saved_parts(name, foods[name])))
+        parts = saved_parts(name, foods[name])
+        # A multiple of the saved amount can be checked before any call to Cronometer.
+        if not unit:
+            checked_grams(text, number * parts[2])
+        wanted.append((text, name, number, unit, parts))
     session = open_session(config)
     # A food's details give its nutrition for the log, and an amount in a unit needs its serving sizes and calories.
     details = session.foods(list(dict.fromkeys(food_id for _, _, _, _, (food_id, _, _) in wanted)))
@@ -843,13 +864,11 @@ def cmd_log(args) -> None:
         food = details.get(food_id)
         if unit:
             found = amount_unit(food, text, name, unit)
-            grams, measure_id = number * found["grams"], found["measure_id"] or measure_id
+            grams, measure_id = checked_grams(text, number * found["grams"]), found["measure_id"] or measure_id
             description = f"{number:g} {found['name']} of {name}"
         else:
             grams = number * saved_grams
             description = name if number == 1 else f"{number:g} × {name}"
-        if round(grams, 3) <= 0:
-            raise CronoError(f"{text} comes to 0 g. Use a larger amount.")
         request = foods[name]["request"]
         request = request if not unit and number == 1 else resize_request(request, grams, measure_id)
         to_log.append((description, request, scaled(food["nutrients"], grams) if food else None))
@@ -1085,8 +1104,8 @@ def ask_amount(option: dict) -> float:
             amount = float(Fraction(text))
         except (ValueError, ZeroDivisionError, OverflowError):
             amount = 0
-        # The request rounds grams to 3 places, so a tiny amount would log 0 g.
-        if round(amount * option["grams"], 3) > 0:
+        # The request rounds grams to 3 places, so a tiny amount would log 0 g. A huge one comes to infinite grams.
+        if math.isfinite(amount * option["grams"]) and round(amount * option["grams"], 3) > 0:
             return amount
         print("Enter a number above 0, such as 1, 1.5, or 1/2.")
 
