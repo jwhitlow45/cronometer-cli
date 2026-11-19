@@ -9,19 +9,22 @@ typeset -gA _crono_units
 # Completes one word of crono log. foods is the saved names array that _crono sets.
 _crono_log_word() {
   if [[ $PREFIX != *:* ]]; then
-    compadd -a foods
+    compadd "$@" -a foods
     return
   fi
   local name=${PREFIX%%:*}
+  [[ -n $name ]] || return 1
   compset -P '*:'
-  compset -P '[0-9./]#'
+  # The amount, and a space after it when the word is quoted, as in 'oat-milk:200 kc'.
+  compset -P '[0-9./]# #'
   if [[ -z ${_crono_units[$name]} ]]; then
     _crono_units[$name]=$(_call_program units crono list --units ${(q)name} 2>/dev/null)
   fi
   local -a units=(${(f)_crono_units[$name]})
   # The list shows each unit as crono names it, and inserts it without spaces, so fl oz goes in as floz. crono reads both.
   local -a words=(${units// /})
-  _wanted units expl unit compadd -M 'm:{a-zA-Z}={A-Za-z}' -d units -a words
+  # -V keeps crono's order, which puts the food's own serving sizes first.
+  _wanted -V units expl unit compadd -M 'm:{a-zA-Z}={A-Za-z}' -d units -a words
 }
 
 _crono() {
