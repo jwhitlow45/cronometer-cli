@@ -1042,26 +1042,36 @@ def search_label(hit: dict, food: dict | None, saved_as: list[str]) -> str:
 def choose_measure(food: dict, suggested_id: str, food_name: str) -> dict | None:
     # The website's suggested serving goes first. sorted keeps the rest in Cronometer's order.
     measures = sorted(food["measures"], key=lambda measure: measure["id"] != suggested_id)
-    width = max(len(measure["name"]) for measure in measures)
+    # Units the food has no serving size for, such as kcal, follow its serving sizes.
+    # kcal logs in the suggested serving size, and other units in the size they convert through.
+    units = [
+        {"id": unit["measure_id"] or measures[0]["id"], "name": unit["name"], "grams": unit["grams"], "converted": True}
+        for unit in food_units(food).values()
+        if unit["converted"]
+    ]
+    options = measures + units
+    width = max(len(option["name"]) for option in options)
     labels = []
-    for measure in measures:
-        details = f"{round(measure['grams'], 1):g} g · {food['nutrients'].get(CALORIES, 0) * measure['grams'] / 100:.0f} kcal"
-        labels.append(f"{measure['name']:<{width}}  {style(details, DIM)}")
+    for option in options:
+        details = f"{round(option['grams'], 1):g} g · {food['nutrients'].get(CALORIES, 0) * option['grams'] / 100:.0f} kcal"
+        labels.append(f"{option['name']:<{width}}  {style(details, DIM)}")
     # The keys come first so a long food name cannot push them off a narrow terminal.
     hint = f"Serving size: ↑/↓ move, enter chooses, q goes back · {food_name}"
     result = pick(labels, hint, dict.fromkeys((*ENTER_KEYS, b" "), "choose"))
-    return measures[result[1]] if result else None
+    return options[result[1]] if result else None
 
 
-def ask_amount(measure: dict) -> float:
+def ask_amount(option: dict) -> float:
+    # A serving size defaults to 1 of it. A unit such as kcal or ml has no sensible default.
+    default = "" if option.get("converted") else "1"
     while True:
-        text = input(f"Amount ({measure['name']}) [1]: ").strip() or "1"
+        text = input(f"Amount ({option['name']}){f' [{default}]' if default else ''}: ").strip() or default
         try:
             amount = float(Fraction(text))
         except (ValueError, ZeroDivisionError, OverflowError):
             amount = 0
         # The request rounds grams to 3 places, so a tiny amount would log 0 g.
-        if round(amount * measure["grams"], 3) > 0:
+        if round(amount * option["grams"], 3) > 0:
             return amount
         print("Enter a number above 0, such as 1, 1.5, or 1/2.")
 
@@ -1135,7 +1145,8 @@ def cmd_search(args) -> None:
         save_searched_food(config, request, hit["name"])
         return
     meal = chosen_meal(args, config)
-    log_foods(session, [(f"{amount:g} × {measure['name']} of {hit['name']}", request)], args.date, meal)
+    amount_text = f"{amount:g} {measure['name']}" if measure.get("converted") else f"{amount:g} × {measure['name']}"
+    log_foods(session, [(f"{amount_text} of {hit['name']}", request)], args.date, meal)
     print(style(nutrition_summary(scaled(food["nutrients"], grams)), DIM))
     print_day_total(session, args.date)
 
