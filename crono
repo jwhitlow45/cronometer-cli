@@ -836,12 +836,13 @@ def cmd_log(args) -> None:
         # Reading every saved request here means a broken one stops the log before anything is added.
         wanted.append((text, name, number, unit, saved_parts(name, foods[name])))
     session = open_session(config)
-    # Only an amount in a unit needs the food's serving sizes and calories.
-    details = session.foods(list(dict.fromkeys(food_id for _, _, _, unit, (food_id, _, _) in wanted if unit)))
+    # A food's details give its nutrition for the log, and an amount in a unit needs its serving sizes and calories.
+    details = session.foods(list(dict.fromkeys(food_id for _, _, _, _, (food_id, _, _) in wanted)))
     to_log = []
     for text, name, number, unit, (food_id, measure_id, saved_grams) in wanted:
+        food = details.get(food_id)
         if unit:
-            found = amount_unit(details.get(food_id), text, name, unit)
+            found = amount_unit(food, text, name, unit)
             grams, measure_id = number * found["grams"], found["measure_id"] or measure_id
             description = f"{number:g} {found['name']} of {name}"
         else:
@@ -850,7 +851,8 @@ def cmd_log(args) -> None:
         if round(grams, 3) <= 0:
             raise CronoError(f"{text} comes to 0 g. Use a larger amount.")
         request = foods[name]["request"]
-        to_log.append((description, request if not unit and number == 1 else resize_request(request, grams, measure_id)))
+        request = request if not unit and number == 1 else resize_request(request, grams, measure_id)
+        to_log.append((description, request, scaled(food["nutrients"], grams) if food else None))
     log_foods(session, to_log, args.date, chosen_meal(args, config))
     print_day_total(session, args.date)
 
@@ -883,18 +885,23 @@ def print_day_total(session: Cronometer, day: date) -> None:
         print(style(note, DIM))
 
 
-def log_foods(session: Cronometer, foods: list[tuple[str, str]], day: date, meal: int) -> None:
-    """Log each (description, request) pair, and record the entries so undo can remove them."""
+def log_foods(session: Cronometer, foods: list[tuple[str, str, dict[int, float] | None]], day: date, meal: int) -> None:
+    """Log each (description, request, nutrients) entry, and record the entries so undo can remove them.
+
+    Each food's nutrition goes under its line, so the day's total printed
+    after the log is not mistaken for what the food added.
+    """
     meal_name = DIARY_GROUPS[meal]
     logged = []
     try:
-        for description, request in foods:
+        for description, request, nutrients in foods:
             serving_id = session.add_serving(request, day, meal)
             if serving_id:
                 logged.append({"name": description, "serving_id": serving_id})
                 print(f"Logged {description} to {meal_name} on {day}.")
             else:
                 print(f"Logged {description} to {meal_name} on {day}, but Cronometer sent no entry id, so undo cannot remove it.")
+            print(style(f"  {nutrition_summary(nutrients)}" if nutrients is not None else "  nutrition unavailable", DIM))
     finally:
         write_json(LAST_LOG_PATH, {"date": day.isoformat(), "servings": logged})
 
@@ -1154,8 +1161,7 @@ def cmd_search(args) -> None:
         return
     meal = chosen_meal(args, config)
     amount_text = f"{amount:g} {measure['name']}" if measure.get("converted") else f"{amount:g} × {measure['name']}"
-    log_foods(session, [(f"{amount_text} of {hit['name']}", request)], args.date, meal)
-    print(style(nutrition_summary(scaled(food["nutrients"], grams)), DIM))
+    log_foods(session, [(f"{amount_text} of {hit['name']}", request, scaled(food["nutrients"], grams))], args.date, meal)
     print_day_total(session, args.date)
 
 
