@@ -54,6 +54,9 @@ CALORIES, CARBS, PROTEIN, FAT, CAFFEINE = 208, 205, 203, 204, 262
 SEARCH_RESULTS = 15
 # A single letter is easy to type by mistake, and would log whichever food starts with it.
 SHORTEST_NAME_START = 2
+# Grams in each mass unit, and milliliters in each volume unit, in US measures.
+MASS_UNITS = {"g": 1, "kg": 1000, "oz": 28.349523125, "lb": 453.59237}
+VOLUME_UNITS = {"ml": 1, "L": 1000, "tsp": 4.92892159375, "tbsp": 14.78676478125, "fl oz": 29.5735295625, "cup": 236.5882365}
 USER_AGENT = "crono-cli"
 TIMEOUT_SECONDS = 30
 
@@ -140,13 +143,12 @@ def locate_add_fields(strings: list[str], tokens: list[str]) -> dict:
     }
 
 
-def scale_request(saved: str, times: float) -> str:
-    """The same saved food with its amount multiplied, as crono log beef-curry:0.5 asks."""
-    if times == 1:
-        return saved
+def resize_request(saved: str, grams: float, measure_id: str) -> str:
+    """The same saved food with a new weight and serving size, as crono log beef-curry:0.5 or americano:16floz asks."""
     strings, tokens = parse_rpc(saved)
-    grams = locate_add_fields(strings, tokens)["grams"]
-    tokens[grams] = str(round(float(tokens[grams]) * times, 3))
+    fields = locate_add_fields(strings, tokens)
+    tokens[fields["grams"]] = str(round(grams, 3))
+    tokens[fields["measure_id"]] = measure_id
     return join_rpc(strings, tokens)
 
 
@@ -251,15 +253,17 @@ def food_from(response: str, food_id: str) -> dict:
     try:
         for position, token in enumerate(tokens):
             if token in measure_refs and tokens[position + 3] == food_id:
-                volume = tokens[position + 6]
-                name_at = position + 7 if volume == "0" or volume.startswith("-") else position + 8
+                # A negative ref points back at a volume read earlier, which crono does not keep.
+                has_volume = tokens[position + 6] != "0" and not tokens[position + 6].startswith("-")
+                name_at = position + 8 if has_volume else position + 7
                 grams = next(float(value) for value in tokens[name_at + 1 :] if "." in value)
                 # Names typed in by users can carry stray spaces, such as "  bar".
                 amount, unit = float(tokens[position + 1]), " ".join(table[int(tokens[name_at]) - 1].split()) or "serving"
                 label = unit if amount == 1 else f"{amount:g} {unit}"
+                ml = float(tokens[position + 7]) if has_volume else None
                 # A serving size with no weight cannot be logged or shown as an amount.
                 if grams > 0:
-                    measures.append({"id": tokens[position + 5], "name": label, "amount": amount, "unit": unit, "grams": grams})
+                    measures.append({"id": tokens[position + 5], "name": label, "amount": amount, "unit": unit, "grams": grams, "ml": ml})
         nutrients = {
             int(tokens[position + 2]): float(tokens[position + 1])
             for position, token in enumerate(tokens)
@@ -301,6 +305,60 @@ def serving_text(food: dict | None, measure_id: str | None, grams: float) -> str
     if not measure:
         return f"{round(grams, 1):g} g"
     return f"{round(grams / measure['grams'] * measure['amount'], 2):g} {measure['unit']}"
+
+
+def unit_key(name: str) -> str:
+    """A unit name compared without case or spaces, so 12floz is 12 fl oz and Cup is cup."""
+    return "".join(name.lower().split())
+
+
+def measure_ml(measure: dict) -> float | None:
+    """A serving size's volume: Cronometer's own figure, or else its unit's when that is a volume unit, such as fl oz."""
+    unit_ml = next((ml for name, ml in VOLUME_UNITS.items() if unit_key(name) == unit_key(measure["unit"])), None)
+    return measure["ml"] or (unit_ml * measure["amount"] if unit_ml else None)
+
+
+def food_units(food: dict) -> dict[str, dict]:
+    """The units an amount of a food can be given in, by unit_key.
+
+    Each has its name, the grams in one of it, the serving size an amount in
+    it is logged in, and whether crono converted it rather than read it from
+    the food. The food's own serving sizes come first, then kcal, which
+    works back from the food's calories and has no serving size of its own.
+    Other mass units convert through the food's mass serving size, preferring
+    g, and only a food with one gets them, since a food people add can give a
+    can a made-up weight such as 100 g. Other volume units convert through
+    the first serving size whose volume crono knows.
+    """
+    units: dict[str, dict] = {}
+
+    def add(name: str, grams: float, measure_id: str | None, converted: bool = True) -> None:
+        units.setdefault(unit_key(name), {"name": name, "grams": grams, "measure_id": measure_id, "converted": converted})
+
+    measures = [measure for measure in food["measures"] if measure["amount"] > 0]
+    for measure in measures:
+        add(measure["unit"], measure["grams"] / measure["amount"], measure["id"], converted=False)
+    calories = food["nutrients"].get(CALORIES, 0)
+    if calories > 0:
+        add("kcal", 100 / calories, None)
+    by_mass = sorted(
+        (measure for measure in measures if unit_key(measure["unit"]) in MASS_UNITS), key=lambda measure: unit_key(measure["unit"]) != "g"
+    )
+    if by_mass:
+        for name, grams in MASS_UNITS.items():
+            add(name, grams, by_mass[0]["id"])
+    by_volume = next((measure for measure in measures if measure_ml(measure)), None)
+    if by_volume:
+        grams_per_ml = by_volume["grams"] / measure_ml(by_volume)
+        for name, ml in VOLUME_UNITS.items():
+            add(name, ml * grams_per_ml, by_volume["id"])
+    return units
+
+
+def find_unit(units: dict[str, dict], typed: str) -> dict | None:
+    """A unit by its name as typed, or by the name without a plural s, as in cups."""
+    key = unit_key(typed)
+    return units.get(key) or (units.get(key[:-1]) if key.endswith("s") else None)
 
 
 def servings_from(response: str) -> list[dict]:
@@ -704,19 +762,44 @@ def resolve_saved(foods: dict, name: str) -> str:
     raise unknown_food(foods, name)
 
 
-def parse_food_amount(text: str) -> tuple[str, float]:
-    """Split NAME:AMOUNT, as in beef-curry:0.5. A name alone logs its saved amount."""
+# A number, then a unit if any, as in 2, 1/2, 1.5cups, or 200 kcal.
+AMOUNT = re.compile(r"(\d+(?:\.\d*)?(?:/\d+)?|\.\d+)\s*(.*)")
+
+
+def parse_food_amount(text: str) -> tuple[str, float, str | None]:
+    """Split NAME:AMOUNT into the name, a number, and a unit if any.
+
+    A number alone is a multiple of the saved amount, as in beef-curry:0.5.
+    A number with a unit is an amount in that unit, as in beef-curry:200kcal.
+    A name alone logs its saved amount.
+    """
     name, colon, amount = text.rpartition(":")
     if not colon:
-        return text, 1.0
+        return text, 1.0, None
+    parts = AMOUNT.fullmatch(amount.strip())
     try:
-        times = float(Fraction(amount))
+        number = float(Fraction(parts[1])) if parts else 0
     except (ValueError, ZeroDivisionError, OverflowError):
-        times = 0
-    if not name or times <= 0:
+        number = 0
+    if not name or number <= 0:
         example = name or "americano"
-        raise CronoError(f"{text}: put a number above 0 after the colon, as in {example}:2 or {example}:1/2.")
-    return name, times
+        raise CronoError(f"{text}: put a number above 0 after the colon, as in {example}:2, {example}:1/2, or {example}:200kcal.")
+    return name, number, parts[2] or None
+
+
+def amount_unit(food: dict | None, text: str, name: str, typed: str) -> dict:
+    """The unit an amount such as beef-curry:200kcal is in, or an error that lists the units the food can be given in."""
+    if not food:
+        raise CronoError(f"{text}: Cronometer sent no details for {name}, so crono cannot work out the amount.")
+    units = food_units(food)
+    found = find_unit(units, typed)
+    if found:
+        return found
+    # Names such as "small or tall - each 12 fl oz" and "cup, mashed" work too, but are too long, or too hard to read, in a list.
+    listed = [unit["name"] for unit in units.values() if re.fullmatch(r"\w+( \w+)?", unit["name"])]
+    raise CronoError(
+        f"{text}: {name} cannot be measured in {typed}. Use a number alone for a multiple of the saved amount, or one of: {', '.join(listed)}."
+    )
 
 
 def cmd_delete(args) -> None:
@@ -738,17 +821,28 @@ def cmd_log(args) -> None:
         return
     config = read_json(CONFIG_PATH, {})
     foods = config.get("foods", {})
-    to_log = []
+    wanted = []
     for text in args.foods:
-        name, times = parse_food_amount(text)
+        name, number, unit = parse_food_amount(text)
         name = resolve_saved(foods, name)
         # Reading every saved request here means a broken one stops the log before anything is added.
-        _, _, grams = saved_parts(name, foods[name])
-        if round(grams * times, 3) <= 0:
-            raise CronoError(f"{text} comes to 0 g. Use a larger amount.")
-        description = name if times == 1 else f"{times:g} × {name}"
-        to_log.append((description, scale_request(foods[name]["request"], times)))
+        wanted.append((text, name, number, unit, saved_parts(name, foods[name])))
     session = open_session(config)
+    # Only an amount in a unit needs the food's serving sizes and calories.
+    details = session.foods(list(dict.fromkeys(food_id for _, _, _, unit, (food_id, _, _) in wanted if unit)))
+    to_log = []
+    for text, name, number, unit, (food_id, measure_id, saved_grams) in wanted:
+        if unit:
+            found = amount_unit(details.get(food_id), text, name, unit)
+            grams, measure_id = number * found["grams"], found["measure_id"] or measure_id
+            description = f"{number:g} {found['name']} of {name}"
+        else:
+            grams = number * saved_grams
+            description = name if number == 1 else f"{number:g} × {name}"
+        if round(grams, 3) <= 0:
+            raise CronoError(f"{text} comes to 0 g. Use a larger amount.")
+        request = foods[name]["request"]
+        to_log.append((description, request if not unit and number == 1 else resize_request(request, grams, measure_id)))
     log_foods(session, to_log, args.date, chosen_meal(args, config))
     print_day_total(session, args.date)
 
@@ -1233,7 +1327,10 @@ def main() -> None:
 
     log = commands.add_parser("log", help="log saved foods, or show the diary when given none")
     log.add_argument(
-        "foods", nargs="*", metavar="NAME", help="saved foods to log, with an optional amount (beef-curry:0.5). With none, show the diary."
+        "foods",
+        nargs="*",
+        metavar="NAME",
+        help="saved foods to log, with an optional amount (beef-curry:0.5) or amount in a unit (beef-curry:200kcal). With none, show the diary.",
     )
     add_date_and_meal(log)
     log.set_defaults(run=cmd_log)
