@@ -724,6 +724,14 @@ def cmd_list(args) -> None:
     if args.names:
         print("\n".join(sorted(foods)))
         return
+    if args.units:
+        name = resolve_saved(foods, args.units)
+        food_id, _, _ = saved_parts(name, foods[name])
+        food = open_session(config).foods([food_id])[food_id]
+        if not food:
+            raise CronoError(f"Cronometer sent no details for {name}.")
+        print("\n".join(unit["name"] for unit in food_units(food).values()))
+        return
     if not foods:
         print("No saved foods. Find one with crono search, then press tab to save it.")
         return
@@ -1329,7 +1337,9 @@ def main() -> None:
     login.set_defaults(run=cmd_login)
 
     list_foods = commands.add_parser("list", help="list saved foods")
-    list_foods.add_argument("--names", action="store_true", help="print only the names, one per line")
+    only = list_foods.add_mutually_exclusive_group()
+    only.add_argument("--names", action="store_true", help="print only the names, one per line")
+    only.add_argument("--units", metavar="NAME", help="print only the units a saved food's amount can be given in, one per line")
     list_foods.set_defaults(run=cmd_list)
 
     delete = commands.add_parser("delete", help="delete saved foods")

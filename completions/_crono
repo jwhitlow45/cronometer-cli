@@ -1,6 +1,28 @@
 #compdef crono
 
-# Completes crono's commands, and saved food names for "crono log".
+# Completes crono's commands, saved food names for "crono log", and after
+# NAME: or NAME:AMOUNT the units that food's amount can be given in.
+
+# Reading a food's units takes a call to Cronometer, so each shell keeps them once read.
+typeset -gA _crono_units
+
+# Completes one word of crono log. foods is the saved names array that _crono sets.
+_crono_log_word() {
+  if [[ $PREFIX != *:* ]]; then
+    compadd -a foods
+    return
+  fi
+  local name=${PREFIX%%:*}
+  compset -P '*:'
+  compset -P '[0-9./]#'
+  if [[ -z ${_crono_units[$name]} ]]; then
+    _crono_units[$name]=$(_call_program units crono list --units ${(q)name} 2>/dev/null)
+  fi
+  local -a units=(${(f)_crono_units[$name]})
+  # The list shows each unit as crono names it, and inserts it without spaces, so fl oz goes in as floz. crono reads both.
+  local -a words=(${units// /})
+  _wanted units expl unit compadd -M 'm:{a-zA-Z}={A-Za-z}' -d units -a words
+}
 
 _crono() {
   local -a commands=(
@@ -36,7 +58,7 @@ _crono() {
   )
   case $command in
     log)
-      _arguments $date_and_meal '*:saved food:compadd -a foods'
+      _arguments $date_and_meal '*:saved food:_crono_log_word'
       ;;
     search)
       _arguments $date_and_meal '*:search words: '
